@@ -6,6 +6,7 @@ langchain_openai
 langchain-ollama
 langchain_text_splitters
 langchain_chroma
+langchain_ollama
 langchain_core
 langchain-anthropic
 langgraph

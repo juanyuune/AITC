@@ -1,88 +1,72 @@
+# ─────────────────────────────────────────────────────────────
+# src/agent/graph.py
+# CHANGED: Phase 1 + Phase 2 applied
+#   - classify_is_question_in_range REMOVED (always returned True — dead node)
+#   - rephrase_question REMOVED (merged into unified_question_analyzer)
+#   - classify_question_type REMOVED (merged into unified_question_analyzer)
+#   - classify_statement_type REMOVED (merged into unified_question_analyzer)
+#   - unified_question_analyzer ADDED (replaces all four above in 1 LLM call)
+# ─────────────────────────────────────────────────────────────
+
 # import LangGraph lib
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph import MessagesState
 from typing_extensions import TypedDict, NotRequired, Annotated
 
 # import langGraph nodes
-from src.agent.nodes.rephrase_question import rephrase_question
-from src.agent.nodes.classify_is_question_in_range import (
-    classify_is_question_in_range,
-)
-from src.agent.nodes.classify_statement_type import classify_statement_type
+# REMOVED: rephrase_question, classify_is_question_in_range,
+#          classify_question_type, classify_statement_type
+from src.agent.nodes.unified_question_analyzer import unified_question_analyzer
 from src.agent.nodes.exact_query import exact_query
 from src.agent.nodes.semantic_retrieval import semantic_retrieval
-from src.agent.nodes.classify_question_type import classify_question_type
 from src.agent.nodes.question_out_of_range import question_out_of_range
 
 # import type
 from src.types.langgraph_state_types import OverallState
 
 
-from langgraph.checkpoint.memory import MemorySaver
-
-
+# Route from unified_question_analyzer to the correct retrieval path
 def question_type_condition_edge(state: OverallState) -> str:
     match state["question_type"]:
         case "EXACT_QUERY":
-            return "classify_statement_type"
+            # unified_question_analyzer already set statement_type,
+            # so we go straight to exact_query (no classify_statement_type needed)
+            return "exact_query"
         case _:
             return "semantic_retrieval"
 
 
-# 若問題超出範圍，則回END
-# 若沒超出範圍，則進入下一個Node：classify_question_type
-def is_question_in_range_edge(state: OverallState) -> str:
-    try:
-        # print("is_question_in_range_edge in========", state["is_question_in_range"])
-        match state["is_question_in_range"]:
-            case "True":
-                return "classify_question_type"
-            case "False":
-                return "question_out_of_range"
-            case _:
-                return "END"
-    except (ValueError, TypeError) as e:
-        print(f"發生錯誤: {e}")
-
-
 # 宣告Graph Workflow
 workflow = StateGraph(OverallState)
-# 宣告LangGraph Ndoe
-workflow.add_node(rephrase_question)
-workflow.add_node(classify_is_question_in_range)
-workflow.add_node(classify_question_type)
-workflow.add_node(classify_statement_type)
+
+# 宣告LangGraph Node
+# REMOVED: rephrase_question, classify_is_question_in_range,
+#          classify_question_type, classify_statement_type
+workflow.add_node(unified_question_analyzer)
 workflow.add_node(exact_query)
 workflow.add_node(semantic_retrieval)
 workflow.add_node(question_out_of_range)
 
 # 宣告LangGraph Edge
-workflow.add_edge(START, "rephrase_question")
-workflow.add_edge("rephrase_question", "classify_is_question_in_range")
-workflow.add_conditional_edges(
-    source="classify_is_question_in_range",  # 判定問題是否涵蓋在「財務報表」類型的問題
-    path=is_question_in_range_edge,
-    path_map={  # 路徑映射
-        "classify_question_type": "classify_question_type",
-        "question_out_of_range": "question_out_of_range",
-    },
-)
-workflow.add_edge("question_out_of_range", END)
+# START → unified_question_analyzer (replaces 4 old nodes)
+workflow.add_edge(START, "unified_question_analyzer")
 
+# Route directly from unified analyzer to retrieval
 workflow.add_conditional_edges(
-    source="classify_question_type",  # 判定問題是「語意檢索」or「精確查詢」
-    path=question_type_condition_edge,  # 決定要走哪個路的函式
-    path_map={  # 路徑映射
+    source="unified_question_analyzer",
+    path=question_type_condition_edge,
+    path_map={
+        "exact_query": "exact_query",
         "semantic_retrieval": "semantic_retrieval",
-        "classify_statement_type": "classify_statement_type",
     },
 )
-workflow.add_edge("classify_statement_type", "exact_query")
 
 workflow.add_edge("exact_query", END)
 workflow.add_edge("semantic_retrieval", END)
 
-# Add simple in-memory checkpointer
-# memory = MemorySaver()
-# graph = workflow.compile(checkpointer=memory)
+# question_out_of_range is kept as a safety node but
+# unified_question_analyzer always returns is_question_in_range="True"
+# so this path is never triggered in normal operation
+workflow.add_edge("question_out_of_range", END)
+
 graph = workflow.compile()

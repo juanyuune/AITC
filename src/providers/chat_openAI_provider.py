@@ -1,30 +1,40 @@
 import os
 from dotenv import load_dotenv
 from langchain_core.messages import BaseMessage
-from langchain_openai import ChatOpenAI
 from langchain_ollama import ChatOllama
-
-
-
-
 
 load_dotenv()
 
-openai_api_key = os.getenv("OPENAI_API_KEY")
-openai_model_name = os.getenv("OPENAI_MODEL_NAME", "gpt-5-mini")
-use_responses_api = openai_model_name.startswith("gpt-5")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://192.168.1.102:11434")
+OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "gemma4:31b")
 
-# chat_model = ChatOpenAI(
-#     model=openai_model_name,
-#     api_key=openai_api_key,
-#     use_responses_api=use_responses_api,
-#     output_version="v0",
-# )
-# Initialize ChatOllama with a cloud-hosted model
 chat_model = ChatOllama(
-    model="gemma4:31b-cloud",  # Explicitly call the cloud variant
-    temperature=0,
+    model=OLLAMA_MODEL,
+    base_url=OLLAMA_BASE_URL,
+    temperature=float(os.getenv("OLLAMA_TEMPERATURE", "0.1")),
+    num_ctx=int(os.getenv("OLLAMA_NUM_CTX", "16384")),
+    top_k=int(os.getenv("OLLAMA_TOP_K", "20")),
+    top_p=float(os.getenv("OLLAMA_TOP_P", "0.9")),
+    repeat_penalty=float(os.getenv("OLLAMA_REPEAT_PENALTY", "1.1")),
 )
 
 def get_message_text(message: BaseMessage) -> str:
-    return message.text().strip()
+    return message.content.strip()
+
+#---
+#import os
+#from dotenv import load_dotenv
+#from langchain_core.messages import BaseMessage
+#from langchain_openai import ChatOpenAI
+
+#load_dotenv()
+
+#chat_model = ChatOpenAI(
+#    model=os.getenv("OPENAI_MODEL_NAME", "gpt-5.5"),
+#    api_key=os.getenv("OPENAI_API_KEY"),
+#    temperature=0.1,
+#)
+
+#def get_message_text(message: BaseMessage) -> str:
+#    return message.content.strip()
+#-----

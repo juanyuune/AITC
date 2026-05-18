@@ -13,6 +13,7 @@ from src.mappings.company_stock_code_array import CompanyStockCodeArray
 from src.providers.chat_openAI_provider import chat_model, get_message_text
 from src.services.account_title_matcher import find_candidates
 from src.types.langgraph_state_types import OverallState
+from src.services.vector_candidate_search import vector_find_candidates
 
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,15 @@ METADATA_FIELD_PREFIXES = (
     "tifrs-notes_Market",
     "tifrs-notes_Industry",
 )
+
+# ── Confidence threshold ───────────────────────────────────────
+# Candidates with score below this are excluded before LLM sees them.
+# Prevents wrong fields like EBT→FinanceCosts (score 19) from polluting results.
+MIN_CANDIDATE_SCORE = 45.0
+
+# If top Chinese-matched candidate has score >= this, trust it directly
+# without calling LLM for disambiguation — saves LLM calls
+CHINESE_TRUST_SCORE = 50.0
 
 
 class PeriodItem(BaseModel):
@@ -93,12 +103,10 @@ class CandidateChoiceBatch(BaseModel):
     choices: List[CandidateChoiceItem] = Field(default_factory=list, description="每個 field_query 對應的最佳候選")
 
 
-# 將 log payload 轉成可讀 JSON 字串，避免直接印 dict 時不易閱讀。
 def dump_log_payload(payload: object) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
 
 
-# 清理要送進 LLM 的文字，避免非法控制字元導致 API request 失敗。
 def sanitize_llm_text(text: str) -> str:
     if not text:
         return ""
@@ -264,6 +272,7 @@ def list_company_reports(company_code: str) -> List[Dict]:
 
 
 def filter_candidates(candidates: List[Dict]) -> List[Dict]:
+    """Remove metadata fields that are never financial values."""
     filtered = []
     for candidate in candidates:
         concept_name = candidate.get("concept_name") or ""
@@ -271,6 +280,22 @@ def filter_candidates(candidates: List[Dict]) -> List[Dict]:
             continue
         filtered.append(candidate)
     return filtered
+
+
+def apply_confidence_threshold(candidates: List[Dict]) -> List[Dict]:
+    """
+    Remove candidates with score below MIN_CANDIDATE_SCORE.
+    Prevents wrong matches like EBT→FinanceCosts (score 19) from reaching LLM.
+    If ALL candidates are below threshold, keep top 1 as last resort.
+    """
+    above = [c for c in candidates if (c.get("score") or 0) >= MIN_CANDIDATE_SCORE]
+    if not above and candidates:
+        print(
+            f"[semantic_retrieval] all candidates below threshold {MIN_CANDIDATE_SCORE} "
+            f"for '{candidates[0].get('matched_query', '')}' — keeping top 1 as last resort"
+        )
+        return candidates[:1]
+    return above
 
 
 def dedupe_candidates(candidates: List[Dict], limit: int) -> List[Dict]:
@@ -291,35 +316,165 @@ def dedupe_candidates(candidates: List[Dict], limit: int) -> List[Dict]:
     return items[:limit]
 
 
-# 依 requirement 提供的多個 field_query 與報表類型，跨 statement 搜集候選欄位並去重排序。
+def is_chinese(text: str) -> bool:
+    """Return True if text contains any Chinese characters."""
+    return any("\u4e00" <= ch <= "\u9fff" for ch in text)
+
+
+# ── IMPROVED: Chinese-first candidate search ───────────────────
 def search_candidates_across_statements(
     field_queries: List[str],
     statement_type: str,
     limit: int,
     company_code: Optional[str] = None,
 ) -> List[Dict]:
+    """
+    Find XBRL concept candidates using Chinese-first strategy.
+
+    WHY CHINESE-FIRST:
+      From Q5 logs — Chinese queries matched correctly every time:
+        營業收入 → ifrs-full_Revenue ✅
+        現金及約當現金 → ifrs-full_CashAndCashEquivalents ✅
+      English abbreviations caused wrong matches:
+        EBT → FinanceCosts ❌ (score 19)
+        Net sales → UnrealizedProfitLossFromSales ❌ (score 55)
+        Turnover → Revenue (lucky guess, score 29)
+
+    STRATEGY:
+      1. Run Chinese queries first (vector search → keyword fallback)
+      2. Only run English queries if Chinese found NO results at all
+      3. Apply confidence threshold — exclude score < 45
+      4. This prevents English abbreviations from polluting Chinese results
+    """
     target_types = (
         [statement_type]
         if statement_type in VALID_STATEMENT_TYPES
         else sorted(VALID_STATEMENT_TYPES)
     )
     collected: List[Dict] = []
-    normalized_queries = [query.strip() for query in field_queries if isinstance(query, str) and query.strip()]
+
+    normalized_queries = [
+        q.strip() for q in field_queries
+        if isinstance(q, str) and q.strip()
+    ]
+
+    # Split into Chinese and English
+    chinese_queries = [q for q in normalized_queries if is_chinese(q)]
+    english_queries = [q for q in normalized_queries if not is_chinese(q)]
+
     for current_statement_type in target_types:
-        for field_query in normalized_queries:
-            for item in filter_candidates(
-                find_candidates(
-                    field_query,
-                    current_statement_type,
+        chinese_found_any = False
+
+        # ── Step 1: Chinese queries first ─────────────────────
+        for field_query in chinese_queries:
+            candidates_found = False
+
+            # Try vector search first
+            try:
+                vector_results = vector_find_candidates(
+                    field_name=field_query,
+                    statement_type=current_statement_type,
                     limit=limit,
                     company_code=company_code,
                 )
-            ):
-                enriched = dict(item)
-                enriched["statement_type"] = current_statement_type
-                enriched["matched_query"] = field_query
-                collected.append(enriched)
-    return dedupe_candidates(collected, limit)
+                if vector_results:
+                    candidates_found = True
+                    chinese_found_any = True
+                    print(
+                        f"[semantic_retrieval] vector_search hit (zh): "
+                        f"field='{field_query}' statement='{current_statement_type}' "
+                        f"top_score={vector_results[0].get('score', 0):.1f}"
+                    )
+                    for item in filter_candidates(vector_results):
+                        enriched = dict(item)
+                        enriched["statement_type"] = current_statement_type
+                        enriched["matched_query"] = field_query
+                        enriched["query_language"] = "zh"
+                        collected.append(enriched)
+                else:
+                    print(
+                        f"[semantic_retrieval] vector_search empty for zh '{field_query}' "
+                        f"— falling back to keyword matching"
+                    )
+            except Exception as exc:
+                print(
+                    f"[semantic_retrieval] vector_search error for '{field_query}': "
+                    f"{exc} — falling back to keyword matching"
+                )
+
+            # Keyword fallback for Chinese
+            if not candidates_found:
+                kw_results = filter_candidates(
+                    find_candidates(
+                        field_query,
+                        current_statement_type,
+                        limit=limit,
+                        company_code=company_code,
+                    )
+                )
+                if kw_results:
+                    chinese_found_any = True
+                for item in kw_results:
+                    enriched = dict(item)
+                    enriched["statement_type"] = current_statement_type
+                    enriched["matched_query"] = field_query
+                    enriched["query_language"] = "zh"
+                    collected.append(enriched)
+
+        # ── Step 2: English only if Chinese found nothing ──────
+        # This is the key fix — EBT/EBIT/Turnover never run when
+        # a good Chinese match already exists
+        if not chinese_found_any:
+            print(
+                f"[semantic_retrieval] Chinese queries found nothing for "
+                f"statement='{current_statement_type}' — trying English fallback"
+            )
+            for field_query in english_queries:
+                candidates_found = False
+                try:
+                    vector_results = vector_find_candidates(
+                        field_name=field_query,
+                        statement_type=current_statement_type,
+                        limit=limit,
+                        company_code=company_code,
+                    )
+                    if vector_results:
+                        candidates_found = True
+                        print(
+                            f"[semantic_retrieval] vector_search hit (en): "
+                            f"field='{field_query}' statement='{current_statement_type}' "
+                            f"top_score={vector_results[0].get('score', 0):.1f}"
+                        )
+                        for item in filter_candidates(vector_results):
+                            enriched = dict(item)
+                            enriched["statement_type"] = current_statement_type
+                            enriched["matched_query"] = field_query
+                            enriched["query_language"] = "en"
+                            collected.append(enriched)
+                except Exception as exc:
+                    print(
+                        f"[semantic_retrieval] vector_search error for en '{field_query}': {exc}"
+                    )
+
+                if not candidates_found:
+                    for item in filter_candidates(
+                        find_candidates(
+                            field_query,
+                            current_statement_type,
+                            limit=limit,
+                            company_code=company_code,
+                        )
+                    ):
+                        enriched = dict(item)
+                        enriched["statement_type"] = current_statement_type
+                        enriched["matched_query"] = field_query
+                        enriched["query_language"] = "en"
+                        collected.append(enriched)
+
+    # Apply confidence threshold before returning
+    deduped = dedupe_candidates(collected, limit * 2)
+    filtered_by_score = apply_confidence_threshold(deduped)
+    return dedupe_candidates(filtered_by_score, limit)
 
 
 def fetch_financial_value(
@@ -398,10 +553,10 @@ def fetch_financial_value(
 
 
 def extract_semantic_plan(question: str) -> Dict:
-    # 先請 LLM 將使用者問題拆成「分析目標 + 需要查的欄位 + 期間」的結構化計畫。
     parser = JsonOutputParser(pydantic_object=SemanticPlanDraft)
     sanitized_question = sanitize_llm_text(question)
     prompt = PromptTemplate(
+        # ── CHANGED: Rule 12 updated to Chinese-first field_query strategy ──
         template="""你是財務資料需求規劃器。
             你的任務是先判斷：要回答使用者問題，至少需要哪些財務數據。
 
@@ -416,14 +571,19 @@ def extract_semantic_plan(question: str) -> Dict:
             - comprehensive_income_statement
             - statement_of_cash_flows
             4. requirements 要列出回答此題真正需要查的欄位。
-            5. 每個 requirement 的 field_query 必須是字串陣列；若有同義詞、近義欄位或複數表達，請全部放進陣列。
+            5. 每個 requirement 的 field_query 必須是字串陣列，規則如下：
+               - 第一個必須是最精確的繁體中文欄位名稱，例如「營業利益」「稅前淨利」「現金及約當現金」
+               - 第二、三個是繁體中文近義詞或常見別名，例如「稅前損益」「稅前盈餘」「約當現金」
+               - 第四個才是對應的英文全名，例如「Operating income」「Cash and cash equivalents」
+               - 絕對不要加入英文縮寫（EBT、EPS、EBIT、ROE、ROA），這些容易造成錯誤比對
+               - 絕對不要加入過於口語或模糊的英文，例如「Turnover」「Net sales」「Earnings」
+               - 每個 requirement 的 field_query 以 4 個為上限
             6. periods 只填問題中明確提到、或回答此題必要的期間。
             7. 如果問題需要比較多個期間，就列出多個 periods。
             8. 若沒有辦法判斷，requirements 仍盡量列出最可能需要的欄位。
             9. 只輸出 JSON，不要輸出 markdown、說明文字或程式碼區塊。
             10. 若問題只提到年份、年度、全年、整年、年增、年度比較，且沒有明確指定 Q1~Q4，periods 中的 quarter 必須填 null，表示要查該年度全年資料。
             11. 只有在問題明確指定季度時，quarter 才能填 1 到 4。
-            12. 每個requirements的field_query至少要提供5種，並且都提供英文，增加找到參考資料可以被比對到的機會。
 
             問題：{question}
 
@@ -434,7 +594,7 @@ def extract_semantic_plan(question: str) -> Dict:
               "analysis_goal": "這題要分析什麼",
               "requirements": [
                 {{
-                  "field_query": ["欄位名稱1", "欄位名稱2"],
+                  "field_query": ["繁體中文欄位名稱", "中文近義詞", "第二中文別名", "English full name"],
                   "statement_type": "balance_sheet 或 comprehensive_income_statement 或 statement_of_cash_flows",
                   "periods": [
                     {{"year": 2024, "quarter": null}},
@@ -473,20 +633,7 @@ def extract_semantic_plan(question: str) -> Dict:
             )
         )
         raise
-    # print(
-    #     "[semantic_retrieval] extract_semantic_plan raw llm response:\n"
-    #     + dump_log_payload(
-    #         {
-    #             "question": sanitized_question,
-    #             "response_content": get_message_text(response),
-    #         }
-    #     )
-    # )
     semantic_plan = normalize_semantic_plan(parser.invoke(response))
-    # print(
-    #     "[semantic_retrieval] extract_semantic_plan parsed JSON:\n"
-    #     + json.dumps(semantic_plan, ensure_ascii=False, indent=2, default=str)
-    # )
     return semantic_plan
 
 
@@ -523,7 +670,7 @@ def choose_best_candidate(question: str, requirement: Dict, candidates: List[Dic
 
     prompt = sanitize_llm_text(
         f"""
-你是財務欄位選擇器。
+你是財務欄位選擇器。系統以台灣 IFRS 財務報表為主，查詢語言以繁體中文為主。
 請根據使用者問題與資料需求，從候選清單中選出最適合查資料的一個 concept_name。
 只能回答 concept_name，不要解釋。
 
@@ -575,13 +722,31 @@ def choose_best_candidates_for_requirement(
         if len(candidates) == 1:
             selected_candidates[field_query] = candidates[0]
             continue
+
         top_candidate = candidates[0]
         second_candidate = candidates[1] if len(candidates) > 1 else None
         top_score = float(top_candidate.get("score") or 0)
         second_score = float(second_candidate.get("score") or 0) if second_candidate else 0.0
+
+        # Auto-select if gap is large enough
         if top_score >= second_score + 12:
             selected_candidates[field_query] = top_candidate
             continue
+
+        # ── NEW: Trust Chinese-matched candidates directly ─────
+        # If top candidate came from a Chinese query and has good score,
+        # skip LLM disambiguation — saves an LLM call per field
+        top_matched_query = top_candidate.get("matched_query", "")
+        top_is_chinese = is_chinese(top_matched_query)
+        if top_is_chinese and top_score >= CHINESE_TRUST_SCORE:
+            print(
+                f"[semantic_retrieval] trusting Chinese-matched candidate "
+                f"'{top_candidate.get('zh_tw')}' score={top_score:.1f} "
+                f"for field_query='{field_query}' — skipping LLM disambiguation"
+            )
+            selected_candidates[field_query] = top_candidate
+            continue
+
         llm_tasks.append(
             {
                 "field_query": field_query,
@@ -612,13 +777,14 @@ def choose_best_candidates_for_requirement(
     }
     prompt = sanitize_llm_text(
         f"""
-你是財務欄位選擇器。
+你是財務欄位選擇器。系統以台灣 IFRS 財務報表為主，查詢語言以繁體中文為主。
 請根據使用者問題與資料需求，為每個 field_query 從對應候選清單中選出最適合查資料的一個 concept_name。
 
 規則：
 1. 只能從該 field_query 自己的 candidates 中選。
 2. 每個 field_query 最多選一個 concept_name。
-3. 只輸出 JSON，不要輸出 markdown、說明文字或程式碼區塊。
+3. 優先選擇 zh_tw 欄位與 field_query 語意最接近的候選。
+4. 只輸出 JSON，不要輸出 markdown、說明文字或程式碼區塊。
 
 ### 使用者問題
 {question}
@@ -679,7 +845,6 @@ def choose_best_candidates_for_requirement(
 
 
 def build_llm_evidence_candidate(candidate: Dict) -> Dict:
-    # 將候選欄位縮成較精簡的證據格式，避免後續傳給 LLM 的 token 過大。
     if not candidate:
         return {}
     return {
@@ -739,10 +904,6 @@ def print_requirement_candidate_score_log(
                 ],
             }
         )
-    # print(
-    #     "[semantic_retrieval] requirement_candidate_score_log:\n"
-    #     + json.dumps(payload, ensure_ascii=False, indent=2, default=str)
-    # )
 
 
 def get_fact_label(field_query: str, candidate: Dict) -> str:
@@ -776,7 +937,6 @@ def is_candidate_low_confidence(field_query: str, candidate: Dict) -> bool:
     field_text = normalize_match_text(field_query)
     combined_candidate_text = f"{concept_name} {label_text}"
 
-    # 常見錯配：使用者要流動/短期資產，卻選到資產總計、短期借款或單一金融資產。
     if any(term in field_text for term in ("liquid assets", "short term assets", "short-term assets")):
         if "assets" == concept_name.split()[-1] or "shorttermborrowings" in concept_name.replace(" ", ""):
             return True
@@ -855,35 +1015,134 @@ def build_computed_metrics(facts: List[Dict]) -> List[Dict]:
             "tifrs-SCF_CashFlowsFromUsedInOperatingActivities",
         ],
     )
+    total_assets = find_numeric_fact(facts, ["ifrs-full_Assets"])
+    total_liabilities = find_numeric_fact(facts, ["ifrs-full_Liabilities"])
+    total_equity = find_numeric_fact(facts, ["ifrs-full_Equity"])
+    revenue = find_numeric_fact(facts, ["ifrs-full_Revenue"])
+    net_income = find_numeric_fact(facts, [
+        "ifrs-full_ProfitLoss",
+        "ifrs-full_ProfitLossFromContinuingOperations",
+    ])
+    operating_income = find_numeric_fact(facts, ["ifrs-full_ProfitLossFromOperatingActivities"])
 
     if current_assets and current_liabilities and current_liabilities["value"]:
-        metrics.append(
-            {
-                "label": "流動比率",
-                "formula": "流動資產 / 流動負債",
-                "value": compact_metric_value(current_assets["value"] / current_liabilities["value"]),
-            }
-        )
+        metrics.append({
+            "label": "流動比率",
+            "formula": "流動資產 / 流動負債",
+            "value": compact_metric_value(current_assets["value"] / current_liabilities["value"]),
+        })
 
     if cash and current_liabilities and current_liabilities["value"]:
-        metrics.append(
-            {
-                "label": "現金對流動負債比",
-                "formula": "現金及約當現金 / 流動負債",
-                "value": compact_metric_value(cash["value"] / current_liabilities["value"]),
-            }
-        )
+        metrics.append({
+            "label": "現金對流動負債比",
+            "formula": "現金及約當現金 / 流動負債",
+            "value": compact_metric_value(cash["value"] / current_liabilities["value"]),
+        })
 
     if operating_cash_flow and current_liabilities and current_liabilities["value"]:
-        metrics.append(
-            {
-                "label": "營業現金流對流動負債比",
-                "formula": "營業活動淨現金流 / 流動負債",
-                "value": compact_metric_value(operating_cash_flow["value"] / current_liabilities["value"]),
-            }
-        )
+        metrics.append({
+            "label": "營業現金流對流動負債比",
+            "formula": "營業活動淨現金流 / 流動負債",
+            "value": compact_metric_value(operating_cash_flow["value"] / current_liabilities["value"]),
+        })
+
+    # ── NEW: additional financial ratios ──────────────────────
+    if total_liabilities and total_assets and total_assets["value"]:
+        metrics.append({
+            "label": "負債比率",
+            "formula": "負債總計 / 資產總計",
+            "value": compact_metric_value(total_liabilities["value"] / total_assets["value"]),
+        })
+
+    if total_liabilities and total_equity and total_equity["value"]:
+        metrics.append({
+            "label": "負債權益比",
+            "formula": "負債總計 / 權益總計",
+            "value": compact_metric_value(total_liabilities["value"] / total_equity["value"]),
+        })
+
+    if operating_income and revenue and revenue["value"]:
+        metrics.append({
+            "label": "營業利益率",
+            "formula": "營業利益 / 營業收入",
+            "value": compact_metric_value(operating_income["value"] / revenue["value"]),
+        })
+
+    if net_income and revenue and revenue["value"]:
+        metrics.append({
+            "label": "淨利率",
+            "formula": "本期淨利 / 營業收入",
+            "value": compact_metric_value(net_income["value"] / revenue["value"]),
+        })
 
     return metrics
+
+
+# ── NEW: accounting cross-validation ──────────────────────────
+def validate_facts_accounting_logic(facts: List[Dict]) -> List[str]:
+    """
+    Check if fetched numbers make basic accounting sense.
+    Returns list of validation warning messages.
+    Prints warnings to log for debugging.
+    """
+    warnings = []
+    fact_map = {
+        f["concept_name"]: f
+        for f in facts
+        if f.get("concept_name") and f.get("value") is not None
+    }
+
+    revenue    = fact_map.get("ifrs-full_Revenue")
+    op_cost    = fact_map.get("tifrs-bsci-ci_OperatingCosts")
+    gross      = fact_map.get("tifrs-bsci-ci_GrossProfitLossFromOperations")
+    op_inc     = fact_map.get("ifrs-full_ProfitLossFromOperatingActivities")
+    tax_exp    = fact_map.get("ifrs-full_IncomeTaxExpenseContinuingOperations")
+    assets     = fact_map.get("ifrs-full_Assets")
+    liab       = fact_map.get("ifrs-full_Liabilities")
+    equity     = fact_map.get("ifrs-full_Equity")
+
+    # Rule 1: Gross profit = Revenue - Operating cost (5% tolerance)
+    if revenue and op_cost and gross:
+        expected = revenue["value"] - op_cost["value"]
+        actual = gross["value"]
+        if expected != 0 and abs(actual - expected) / abs(expected) > 0.05:
+            msg = (
+                f"[validation] WARN: 毛利驗證失敗 "
+                f"預期={expected:,.0f} 實際={actual:,.0f} "
+                f"(誤差 {abs(actual-expected)/abs(expected)*100:.1f}%)"
+            )
+            print(msg)
+            warnings.append(msg)
+
+    # Rule 2: Tax expense should be less than operating income
+    if tax_exp and op_inc and op_inc["value"] > 0:
+        if abs(tax_exp["value"]) >= abs(op_inc["value"]):
+            msg = (
+                f"[validation] WARN: 所得稅費用 ({tax_exp['value']:,.0f}) "
+                f">= 營業利益 ({op_inc['value']:,.0f}) — 可能抓到錯誤欄位"
+            )
+            print(msg)
+            warnings.append(msg)
+
+    # Rule 3: Assets = Liabilities + Equity (1% tolerance)
+    if assets and liab and equity:
+        expected = liab["value"] + equity["value"]
+        actual = assets["value"]
+        if expected != 0 and abs(actual - expected) / abs(expected) > 0.01:
+            msg = (
+                f"[validation] WARN: 會計恆等式驗證失敗 "
+                f"資產={actual:,.0f} 負債+權益={expected:,.0f} "
+                f"(誤差 {abs(actual-expected)/abs(expected)*100:.1f}%)"
+            )
+            print(msg)
+            warnings.append(msg)
+
+    if warnings:
+        print(f"[validation] {len(warnings)} warning(s) found — check candidate selection above")
+    else:
+        print("[validation] accounting logic check passed ✅")
+
+    return warnings
 
 
 def build_final_answer_evidence(
@@ -969,6 +1228,8 @@ def build_final_answer_evidence(
         period_keys.add(period_key)
         periods.append(period)
 
+    computed_metrics = build_computed_metrics(facts)
+
     return {
         "question": question,
         "analysis_goal": plan.get("analysis_goal"),
@@ -980,7 +1241,7 @@ def build_final_answer_evidence(
         },
         "periods": periods,
         "facts": facts,
-        "computed_metrics": build_computed_metrics(facts),
+        "computed_metrics": computed_metrics,
         "excluded_or_low_confidence_facts": excluded_or_low_confidence_facts[:20],
     }
 
@@ -1014,7 +1275,6 @@ def print_unique_log_item_names(label: str, details: List[Dict]) -> None:
 
 
 def retrieve_requirement_data(question: str, company: Dict, requirement: Dict) -> Dict:
-    # 針對單一 requirement 中的每個 field_query 逐一找候選欄位，並以 requirement 為單位批次挑選最佳 concept，再查各期間數值。
     field_queries = requirement.get("field_query", [])
     query_results = []
     values = []
@@ -1024,7 +1284,6 @@ def retrieve_requirement_data(question: str, company: Dict, requirement: Dict) -
 
     candidate_search_started_at = perf_counter()
     for field_query in field_queries:
-        # 先根據 field_query、報表類型與公司常用 family 範圍，找出可比對的候選 XBRL concept。
         candidates = search_candidates_across_statements(
             field_queries=[field_query],
             statement_type=requirement["statement_type"],
@@ -1033,9 +1292,11 @@ def retrieve_requirement_data(question: str, company: Dict, requirement: Dict) -
         )
         candidates_by_field_query[field_query] = candidates
     print(
-        f"[timing] semantic_retrieval.match_requirement_field_queries took {perf_counter() - candidate_search_started_at:.3f}s "
-        f"(statement_type={requirement.get('statement_type')}, field_queries={len(field_queries)}, "
-        f"candidate_count={sum(len(candidates) for candidates in candidates_by_field_query.values())})"
+        f"[timing] semantic_retrieval.match_requirement_field_queries took "
+        f"{perf_counter() - candidate_search_started_at:.3f}s "
+        f"(statement_type={requirement.get('statement_type')}, "
+        f"field_queries={len(field_queries)}, "
+        f"candidate_count={sum(len(c) for c in candidates_by_field_query.values())})"
     )
 
     selected_candidates_by_field_query = choose_best_candidates_for_requirement(
@@ -1070,20 +1331,6 @@ def retrieve_requirement_data(question: str, company: Dict, requirement: Dict) -
                 if value_key in value_result_cache:
                     result = value_result_cache[value_key]
                 else:
-                    # if quarter is None:
-                    #     print(
-                    #         "[semantic_retrieval] fetch_financial_value in annual mode (quarter missing, fallback to Q4 cumulative/year-end):\n"
-                    #         + json.dumps(
-                    #             {
-                    #                 "field_query": field_query,
-                    #                 "period": period,
-                    #                 "selected_candidate": build_llm_evidence_candidate(selected_candidate),
-                    #             },
-                    #             ensure_ascii=False,
-                    #             indent=2,
-                    #         )
-                    #     )
-                    # 針對選中的 concept，在指定公司與期間上查詢實際財務數值。
                     result = fetch_financial_value(
                         company_code=company["companyCode"],
                         year=period["year"],
@@ -1103,17 +1350,15 @@ def retrieve_requirement_data(question: str, company: Dict, requirement: Dict) -
                 if value_key is not None:
                     emitted_value_keys.add(value_key)
 
-        # 保留每個 field_query 的完整查詢結果，供後續 fulfilled/planned 統計與最終證據組裝使用。
         query_results.append(
             {
                 "field_query": field_query,
                 "selected_candidate": build_llm_evidence_candidate(selected_candidate),
-                "candidates": [build_llm_evidence_candidate(candidate) for candidate in candidates],
+                "candidates": [build_llm_evidence_candidate(c) for c in candidates],
                 "values": query_values,
             }
         )
 
-    # 回傳這個 requirement 底下所有 field_query 的結果彙總，以及展平後的 values 清單。
     return {
         "requirement": requirement,
         "query_results": query_results,
@@ -1122,11 +1367,6 @@ def retrieve_requirement_data(question: str, company: Dict, requirement: Dict) -
 
 
 def semantic_retrieval(state: OverallState) -> OverallState:
-    # 語意檢索主流程：
-    # 1. 讓 LLM 規劃回答問題需要哪些財務資料
-    # 2. 解析公司並查詢實際可用報表
-    # 3. 逐個 requirement 取回資料庫證據
-    # 4. 若證據足夠，再交給 LLM 產生最終分析回答
     print("semantic_retrieval in =======")
     started_at = perf_counter()
 
@@ -1134,7 +1374,6 @@ def semantic_retrieval(state: OverallState) -> OverallState:
     try:
         step_started_at = perf_counter()
         plan = extract_semantic_plan(question)
-        # print(f"[semantic_retrieval] extract_semantic_plan plan:\n{json.dumps(plan, ensure_ascii=False, indent=2)}")
         print(f"[timing] semantic_retrieval.extract_semantic_plan took {perf_counter() - step_started_at:.3f}s")
     except Exception as exc:
         return {
@@ -1149,8 +1388,8 @@ def semantic_retrieval(state: OverallState) -> OverallState:
     step_started_at = perf_counter()
     company = resolve_company(plan.get("company_identifiers") or plan.get("company_identifier", ""))
     print(f"company: {json.dumps(company, ensure_ascii=False, indent=2)}")
-
     print(f"[timing] semantic_retrieval.resolve_company took {perf_counter() - step_started_at:.3f}s")
+
     if not company:
         return {
             **state,
@@ -1161,10 +1400,6 @@ def semantic_retrieval(state: OverallState) -> OverallState:
     step_started_at = perf_counter()
     available_reports = list_company_reports(company["companyCode"])
     print(f"[timing] semantic_retrieval.list_company_reports took {perf_counter() - step_started_at:.3f}s")
-    # print("\n[semantic_retrieval] company:")
-    # print(json.dumps(company, ensure_ascii=False, indent=2))
-    # print("\n[semantic_retrieval] available_reports:")
-    # print(json.dumps(available_reports[:20], ensure_ascii=False, indent=2))
 
     retrieval_results = []
     step_started_at = perf_counter()
@@ -1179,6 +1414,12 @@ def semantic_retrieval(state: OverallState) -> OverallState:
         company=company,
         retrieval_results=retrieval_results,
     )
+
+    # ── NEW: cross-validate accounting logic ──────────────────
+    validation_warnings = validate_facts_accounting_logic(llm_evidence_json.get("facts", []))
+    if validation_warnings:
+        llm_evidence_json["validation_warnings"] = validation_warnings
+
     evidence_json = {
         "question": question,
         "analysis_goal": plan.get("analysis_goal"),
@@ -1187,10 +1428,6 @@ def semantic_retrieval(state: OverallState) -> OverallState:
         "retrieval_results": retrieval_results,
         "llm_evidence": llm_evidence_json,
     }
-    # print("\n[semantic_retrieval] evidence_json:")
-    # print(json.dumps(evidence_json, ensure_ascii=False, indent=2))
-    # print("\n[semantic_retrieval] llm_evidence_json:")
-    # print(json.dumps(llm_evidence_json, ensure_ascii=False, indent=2))
 
     fulfilled_items = 0
     planned_items = 0
@@ -1232,15 +1469,6 @@ def semantic_retrieval(state: OverallState) -> OverallState:
                 fulfilled_items += 1
                 fulfilled_details.append(detail)
 
-    # print(
-    #     "[semantic_retrieval] planned_details:\n"
-    #     + json.dumps(planned_details, ensure_ascii=False, indent=2, default=str)
-    # )
-    # print(
-    #     "[semantic_retrieval] fulfilled_details:\n"
-    #     + json.dumps(fulfilled_details, ensure_ascii=False, indent=2, default=str)
-    # )
-
     print_unique_log_item_names("[semantic_retrieval] fulfilled_items_list:", fulfilled_details)
     print_unique_log_item_names("[semantic_retrieval] planned_items_list:", planned_details)
 
@@ -1260,19 +1488,6 @@ def semantic_retrieval(state: OverallState) -> OverallState:
     print("fulfilled_items =", fulfilled_items)
     print("planned_items =", planned_items)
     enough_information = bool(llm_evidence_json.get("facts"))
-    # enough_information = fulfilled_items > 0 and fulfilled_items == planned_items
-
-    # print(
-    #     json.dumps(
-    #         {
-    #             "planned_items": planned_items,
-    #             "fulfilled_items": fulfilled_items,
-    #             "enough_information": enough_information,
-    #         },
-    #         ensure_ascii=False,
-    #         indent=2,
-    #     )
-    # )
 
     if not enough_information:
         print(f"[timing] semantic_retrieval.total took {perf_counter() - started_at:.3f}s")
@@ -1282,8 +1497,17 @@ def semantic_retrieval(state: OverallState) -> OverallState:
             "reference_data": evidence_json,
         }
 
+    # ── IMPROVED: final_prompt with all rules ─────────────────
+    validation_note = ""
+    if validation_warnings:
+        validation_note = f"""
+        ### 資料驗證警告
+        以下欄位的數值可能有誤，請謹慎引用：
+        {chr(10).join(f'- {w}' for w in validation_warnings)}
+        """
+
     final_prompt = f"""
-        你是信用徵審財報分析助手。
+        你是信用徵審財報分析助手。系統資料來自台灣 IFRS 財務報表，查詢以繁體中文為主。
         請只根據 JSON evidence 回答，不要臆測。
 
         規則：
@@ -1291,6 +1515,11 @@ def semantic_retrieval(state: OverallState) -> OverallState:
         2. 若需要比較、趨勢、增減或比率，優先使用 computed_metrics；不足時才用 facts 中的數值計算。
         3. 回答使用繁體中文，數值請加上千分位與單位。
         4. 若有被排除或低可信資料，只能在補充說明簡短提醒，不要拿來下結論。
+        5. 絕對不可在回答中顯示任何 XBRL 代碼、concept_name 或技術欄位 ID。
+           例如 ifrs-full:CashAndCashEquivalents、tifrs-bsci-ci_xxx 這類格式絕對不能出現在回答中。
+        6. 用自然口語化的繁體中文回答，像一位專業財務助手在對話，避免顯示技術性內部資料或使用 backtick (`) 包住文字。
+        7. 若 JSON 中有 validation_warnings，表示部分數值可能抓取錯誤，回答時對這些數值保持保留態度，不要用來下關鍵結論。
+        8. computed_metrics 中的比率已由系統自動計算，數值可信度高於個別 facts，優先引用。
 
         請依照以下格式回答：
         一、關鍵證據
@@ -1305,10 +1534,11 @@ def semantic_retrieval(state: OverallState) -> OverallState:
 
         ### 使用者問題
         {question}
-
+        {validation_note}
         ### JSON 證據資料
         {json.dumps(llm_evidence_json, ensure_ascii=False, indent=2)}
         """
+
     try:
         print("[semantic_retrieval] final_answer prompt:\n" + final_prompt)
         step_started_at = perf_counter()
@@ -1320,8 +1550,8 @@ def semantic_retrieval(state: OverallState) -> OverallState:
             f"你可以先參考 reference_data 中的 JSON 證據。錯誤：{exc}"
         )
     print("[semantic_retrieval] final_answer:\n" + str(final_answer))
-
     print(f"[timing] semantic_retrieval.total took {perf_counter() - started_at:.3f}s")
+
     return {
         **state,
         "answer": final_answer,

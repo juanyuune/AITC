@@ -14,6 +14,7 @@ from src.mappings.company_stock_code_array import CompanyStockCodeArray
 from src.providers.chat_openAI_provider import chat_model, get_message_text
 from src.services.account_title_matcher import find_candidates, search_item_source_paths
 from src.types.langgraph_state_types import OverallState
+from src.services.vector_candidate_search import vector_find_candidates
 
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,16 @@ METADATA_FIELD_PREFIXES = (
     "tifrs-notes_Market",
     "tifrs-notes_Industry",
 )
+
+# ── Confidence threshold ───────────────────────────────────────
+# Candidates below this score are excluded before selection.
+# Prevents wrong matches like 避險之金融資產 (score 23) from winning
+# over 現金及約當現金 (correct concept) in Q1.
+MIN_CANDIDATE_SCORE = 45.0
+
+# If top Chinese-matched candidate has score >= this,
+# trust it directly without calling LLM — saves one LLM call per field
+CHINESE_TRUST_SCORE = 50.0
 
 
 class Period(BaseModel):
@@ -195,6 +206,7 @@ quarter 請回傳 1 到 4 的整數。
 
 
 def filter_candidates(candidates: List[Dict]) -> List[Dict]:
+    """Remove metadata fields that are never financial values."""
     filtered = []
     for candidate in candidates:
         concept_name = candidate.get("concept_name") or ""
@@ -202,6 +214,23 @@ def filter_candidates(candidates: List[Dict]) -> List[Dict]:
             continue
         filtered.append(candidate)
     return filtered
+
+
+def apply_confidence_threshold(candidates: List[Dict]) -> List[Dict]:
+    """
+    Remove candidates with score below MIN_CANDIDATE_SCORE.
+    Directly fixes Q1 problem: 避險之金融資產 scored 23 and ranked #1
+    before the correct 現金及約當現金. With threshold=45, it gets excluded.
+    If ALL candidates are below threshold, keep top 1 as last resort.
+    """
+    above = [c for c in candidates if (c.get("score") or 0) >= MIN_CANDIDATE_SCORE]
+    if not above and candidates:
+        print(
+            f"[exact_query] all candidates below threshold {MIN_CANDIDATE_SCORE} "
+            f"— keeping top 1 as last resort"
+        )
+        return candidates[:1]
+    return above
 
 
 def dedupe_candidates(candidates: List[Dict]) -> List[Dict]:
@@ -248,6 +277,59 @@ def field_name_match_score(left: Optional[str], right: Optional[str]) -> float:
     return SequenceMatcher(None, left_norm, right_norm).ratio()
 
 
+def is_chinese(text: str) -> bool:
+    """Return True if text contains any Chinese characters."""
+    return any("\u4e00" <= ch <= "\u9fff" for ch in text)
+
+
+def get_candidates_with_fallback(
+    field_name: str,
+    statement_type: str,
+    limit: int = 8,
+    company_code: Optional[str] = None,
+    industry_type: Optional[str] = None,
+) -> List[Dict]:
+    """
+    Try vector search first (semantic meaning-based matching).
+    Fall back to keyword matching if cache is empty or embedding fails.
+
+    Direct fix for Q1 wrong-candidate problem:
+      Before: SequenceMatcher scored 避險之金融資產 = 23 (WRONG, ranked #1)
+      After:  vector search scores 現金及約當現金 ≈ CashAndCashEquivalents → correct concept ranks first
+
+    Chinese fields benefit most — vector search understands that
+    現金及約當現金 and CashAndCashEquivalents mean the same thing.
+    """
+    try:
+        results = vector_find_candidates(
+            field_name=field_name,
+            statement_type=statement_type,
+            limit=limit,
+            company_code=company_code,
+        )
+        if results:
+            print(
+                f"[exact_query] vector_search hit for '{field_name}' "
+                f"statement='{statement_type}' top_score={results[0].get('score', 0):.1f}"
+            )
+            return results
+        print(
+            f"[exact_query] vector_search empty for '{field_name}' "
+            f"— cache not built? falling back to keyword matching"
+        )
+    except Exception as exc:
+        print(f"[exact_query] vector_search error: {exc} — falling back to keyword matching")
+
+    # Fallback: original keyword/SequenceMatcher approach
+    return find_candidates(
+        field_name,
+        statement_type,
+        limit=limit,
+        company_code=company_code,
+        industry_type=industry_type,
+    )
+
+
 def build_statement_type_candidates(
     field_name: str,
     statement_types: List[str],
@@ -255,19 +337,26 @@ def build_statement_type_candidates(
     industry_type: Optional[str],
     limit_per_type: int = 8,
 ) -> List[Dict]:
+    """
+    Find candidates across all relevant statement types.
+
+    IMPROVED: applies confidence threshold after collecting all candidates.
+    This prevents low-score wrong matches from reaching select_candidate().
+    """
     normalized_types = normalize_statement_types(statement_types) or list(VALID_STATEMENT_TYPES)
     all_candidates: List[Dict] = []
     candidate_logs: List[Dict] = []
+
     for statement_type in normalized_types:
-        candidates = filter_candidates(
-            find_candidates(
-                field_name,
-                statement_type,
-                limit=limit_per_type,
-                company_code=company_code,
-                industry_type=industry_type,
-            )
+        raw_candidates = get_candidates_with_fallback(
+            field_name=field_name,
+            statement_type=statement_type,
+            limit=limit_per_type,
+            company_code=company_code,
+            industry_type=industry_type,
         )
+        candidates = filter_candidates(raw_candidates)
+
         dictionary_sources = search_item_source_paths(statement_type, company_code)
         candidate_logs.append(
             {
@@ -305,6 +394,12 @@ def build_statement_type_candidates(
             item.get("concept_name") or "",
         )
     )
+
+    # ── Apply confidence threshold ─────────────────────────────
+    # Remove low-score candidates before they reach LLM selection.
+    # Key fix: 避險之金融資產 (score 23) excluded → correct concept wins.
+    deduped_candidates = apply_confidence_threshold(deduped_candidates)
+
     print(
         "[exact_query] candidate_search_by_statement_type:\n"
         + dump_log_payload(candidate_logs)
@@ -329,144 +424,88 @@ def select_candidate(
     statement_types: List[str],
     candidates: List[Dict],
 ) -> Optional[Dict]:
+    """
+    Select the best candidate for a given field.
+
+    IMPROVED: if the top candidate came from a Chinese query and has
+    a good score, trust it directly without calling LLM.
+    This saves one LLM call per field for Chinese questions.
+    """
     if not candidates:
-        print(
-            "[exact_query] candidate_selection_skipped:\n"
-            + dump_log_payload(
-                {
-                    "field_name": field_name,
-                    "reason": "no_candidates",
-                    "statement_types": statement_types,
-                }
-            )
-        )
         return None
     if len(candidates) == 1:
-        print(
-            "[exact_query] candidate_selection_single_candidate:\n"
-            + dump_log_payload(
-                {
-                    "field_name": field_name,
-                    "statement_types": statement_types,
-                    "selected_candidate": summarize_candidates(candidates, limit=1)[0],
-                }
-            )
-        )
         return candidates[0]
 
-    options = [
-        {
-            "concept_name": item.get("concept_name"),
-            "statement_type": item.get("statement_type"),
-            "code": item.get("code"),
-            "zh_tw": item.get("zh_tw"),
-            "en": item.get("en"),
-            "mapping_canonical_zh": item.get("mapping_canonical_zh"),
-            "mapping_canonical_en": item.get("mapping_canonical_en"),
-            "mapping_aliases": item.get("mapping_aliases", [])[:8],
-            "score": item.get("score"),
-            "dictionary_sources": item.get("dictionary_sources", []),
-        }
-        for item in candidates
-    ]
-    print(
-        "==========[exact_query] options:\n"
-        + dump_log_payload(
-            {
-                "options": options
-            }
+    top_candidate = candidates[0]
+    second_candidate = candidates[1] if len(candidates) > 1 else None
+    top_score = float(top_candidate.get("score") or 0)
+    second_score = float(second_candidate.get("score") or 0) if second_candidate else 0.0
+
+    # Auto-select if gap is large
+    if top_score >= second_score + 12:
+        print(
+            f"[exact_query] auto-selected '{top_candidate.get('zh_tw')}' "
+            f"score={top_score:.1f} gap={top_score - second_score:.1f} "
+            f"for field='{field_name}'"
         )
-    )
+        return top_candidate
 
-    prompt = f"""
-你是一個財報欄位對應助手。
-請依照使用者問題，從候選清單中選出最符合的候選欄位。
-你必須同時考慮 concept_name 與 statement_type，因為不同報表可能有相似欄位。
-只能從候選清單中挑選。
-只回答 JSON，不要解釋。
+    # ── NEW: trust Chinese-matched top candidate ───────────────
+    # If the field_name itself is Chinese and top score is good,
+    # skip LLM disambiguation — the Chinese query already found the right concept
+    if is_chinese(field_name) and top_score >= CHINESE_TRUST_SCORE:
+        print(
+            f"[exact_query] trusting Chinese-matched candidate "
+            f"'{top_candidate.get('zh_tw')}' score={top_score:.1f} "
+            f"for field='{field_name}' — skipping LLM disambiguation"
+        )
+        return top_candidate
 
-### 允許的報表別
-{statement_types}
+    # LLM disambiguation for ambiguous cases
+    compact_candidates = [
+        {
+            "concept_name": c.get("concept_name"),
+            "zh_tw": c.get("zh_tw"),
+            "en": c.get("en"),
+            "code": c.get("code"),
+            "statement_type": c.get("statement_type"),
+            "score": c.get("score"),
+        }
+        for c in candidates[:5]
+    ]
+
+    prompt = f"""你是財務欄位選擇器。系統以台灣 IFRS 財務報表為主，查詢語言以繁體中文為主。
+請根據使用者問題與查詢欄位，從候選清單中選出最適合查資料的一個 concept_name。
+只能回答 concept_name，不要解釋。
 
 ### 使用者問題
 {user_question}
 
-### 使用者要找的欄位
+### 查詢欄位
 {field_name}
 
 ### 候選清單
-{options}
+{json.dumps(compact_candidates, ensure_ascii=False, indent=2)}
 """
-    parser = JsonOutputParser(pydantic_object=SelectedCandidateSchema)
-    prompt_with_format = (
-        prompt
-        + f"""
+    try:
+        print(f"[exact_query] select_candidate LLM prompt for field='{field_name}'")
+        response = chat_model.invoke(prompt)
+        chosen = get_message_text(response).strip()
+        for candidate in candidates:
+            if candidate.get("concept_name") == chosen:
+                print(
+                    f"[exact_query] LLM selected '{candidate.get('zh_tw')}' "
+                    f"for field='{field_name}'"
+                )
+                return candidate
+        print(
+            f"[exact_query] LLM output '{chosen}' did not match any candidate "
+            f"for field='{field_name}' — using top candidate"
+        )
+    except Exception as exc:
+        print(f"[exact_query] select_candidate LLM error: {exc} — using top candidate")
 
-### JSON 格式
-{parser.get_format_instructions()}
-"""
-    )
-    print("[exact_query] candidate_selection prompt:\n" + prompt_with_format)
-    response = chat_model.invoke(prompt_with_format)
-    raw_response = get_message_text(response)
-    print(
-        "[exact_query] candidate_selection_llm_raw_response:\n"
-        + dump_log_payload(
-            {
-                "field_name": field_name,
-                "statement_types": statement_types,
-                "raw_response": raw_response,
-            }
-        )
-    )
-    parsed = parser.parse(raw_response)
-    concept_name = parsed.get("concept_name")
-    chosen_statement_type = parsed.get("statement_type")
-    for candidate in candidates:
-        if (
-            candidate.get("concept_name") == concept_name
-            and candidate.get("statement_type") == chosen_statement_type
-        ):
-            print(
-                "[exact_query] candidate_selection_result:\n"
-                + dump_log_payload(
-                    {
-                        "field_name": field_name,
-                        "statement_types": statement_types,
-                        "selection_mode": "llm_exact_match",
-                        "selected_candidate": summarize_candidates([candidate], limit=1)[0],
-                    }
-                )
-            )
-            return candidate
-    for candidate in candidates:
-        if candidate.get("concept_name") == concept_name:
-            print(
-                "[exact_query] candidate_selection_result:\n"
-                + dump_log_payload(
-                    {
-                        "field_name": field_name,
-                        "statement_types": statement_types,
-                        "selection_mode": "llm_concept_match_fallback_statement_type",
-                        "selected_candidate": summarize_candidates([candidate], limit=1)[0],
-                        "llm_output": parsed,
-                    }
-                )
-            )
-            return candidate
-    print(
-        "[exact_query] candidate_selection_result:\n"
-        + dump_log_payload(
-            {
-                "field_name": field_name,
-                "statement_types": statement_types,
-                "selection_mode": "fallback_first_candidate",
-                "selected_candidate": summarize_candidates(candidates, limit=1)[0],
-                "llm_output": parsed,
-            }
-        )
-    )
-    return candidates[0]
+    return top_candidate
 
 
 class SelectedCandidateSchema(BaseModel):
@@ -580,23 +619,29 @@ def resolve_answer_data(
             concept_id=candidate["concept_name"],
             industry_type=company_profile.get("industry_type"),
         )
-      
-      
         if answer_data:
             return answer_data, candidate, attempt_logs
-        
-    print(f"========No Answer Data Found for field '{schema.get('requested_fields', [{}])[0].get('field')}' with candidates:\n{dump_log_payload(ordered_candidates)}")
+
+    print(
+        f"========No Answer Data Found for field "
+        f"'{schema.get('requested_fields', [{}])[0].get('field')}' "
+        f"with candidates:\n{dump_log_payload(ordered_candidates)}"
+    )
     return None, selected_candidate, attempt_logs
 
 
 def exact_query(state: OverallState) -> OverallState:
     started_at = perf_counter()
     logger.info("[exact_query] input state:\n%s", dump_log_payload(state))
+
     step_started_at = perf_counter()
     schema = extract_question_schema(state["user_input"])
     schema = resolve_company(schema)
     company_profile = resolve_company_profile(schema.get("companyCode", ""))
-    print(f"[timing] exact_query.extract_question_schema_and_resolve_company took {perf_counter() - step_started_at:.3f}s")
+    print(
+        f"[timing] exact_query.extract_question_schema_and_resolve_company "
+        f"took {perf_counter() - step_started_at:.3f}s"
+    )
 
     requested_fields = schema.get("requested_fields", [])
     if not requested_fields:
@@ -824,13 +869,20 @@ def exact_query(state: OverallState) -> OverallState:
             },
         }
 
-    final_prompt = f"""
-你是一個專業的信用徵審團隊助手，請根據資料庫查到的財務報表資料直接回答問題。
-若問題一次要求多個欄位，請逐項列出。
-若答案為數字，請保留正負號，加入千分位格式，並帶出單位。
-若該欄位中文名稱存在，優先用中文欄位名稱表達。
-若有些欄位查不到，請簡短註明哪些欄位查無主期間資料。
-不要臆測，僅根據提供資料回答。
+    final_prompt = f"""你是一個專業的信用徵信團隊助手，系統以台灣 IFRS 財務報表為主。
+請根據資料庫查到的財務報表資料直接回答問題。
+
+規則：
+1. 若問題一次要求多個欄位，請逐項列出。
+2. 若答案為數字，請保留正負號，加入千分位格式，並帶出單位。
+3. 若該欄位中文名稱存在，優先用中文欄位名稱表達。
+4. 若有些欄位查不到，請簡短註明哪些欄位查無主期間資料。
+5. 不要臆測，僅根據提供資料回答。
+6. 請用自然、口語化的繁體中文方式回答，像一位專業助手在說話。
+7. 絕對不可在回答中顯示任何 XBRL 代碼、concept_name 或技術欄位 ID。
+   例如 ifrs-full:CashAndCashEquivalents、tifrs-bsci-ci_xxx 這類格式絕對不能出現在回答中。
+8. 不要使用 backtick (`) 包住任何文字。
+9. 避免過度條列式格式，用自然段落回答。
 
 ### 問題
 {state['user_input']}
@@ -854,6 +906,7 @@ def exact_query(state: OverallState) -> OverallState:
     print(f"[timing] exact_query.final_answer_generation took {perf_counter() - step_started_at:.3f}s")
     print("[exact_query] final_answer:\n" + str(final_answer))
     print(f"[timing] exact_query.total took {perf_counter() - started_at:.3f}s")
+
     return {
         **state,
         "answer": final_answer,
