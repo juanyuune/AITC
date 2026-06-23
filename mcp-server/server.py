@@ -77,6 +77,29 @@ def fmt_period(year: int, quarter: str) -> str:
     return f"{year}{quarter}" if quarter else str(year)
 
 
+# Single-quarter date windows for Taiwan XBRL
+_Q_WINDOWS = {
+    "Q1": ("01-01", "03-31"),
+    "Q2": ("04-01", "06-30"),
+    "Q3": ("07-01", "09-30"),
+    "Q4": ("10-01", "12-31"),
+}
+
+
+def period_bounds(year: int, quarter: str):
+    """Return (single_start, single_end, ytd_start, ytd_end) ISO date strings."""
+    if quarter in _Q_WINDOWS:
+        s_mmdd, e_mmdd = _Q_WINDOWS[quarter]
+        single_start = f"{year}-{s_mmdd}"
+        single_end = f"{year}-{e_mmdd}"
+    else:
+        single_start = f"{year}-01-01"
+        single_end = f"{year}-12-31"
+    ytd_start = f"{year}-01-01"
+    ytd_end = single_end
+    return single_start, single_end, ytd_start, ytd_end
+
+
 def q4_caveat(quarters: list) -> Optional[str]:
     if "Q4" in quarters:
         return (
@@ -230,8 +253,15 @@ def get_company_financials(
     """
     try:
         year, quarter = parse_period(period)
-        where = ["fmv.company_code = ?", "fmv.year = ?", "fmv.quarter = ?"]
-        params = [company_code, year, quarter]
+        single_start, single_end, ytd_start, ytd_end = period_bounds(year, quarter)
+        where = [
+            "fmv.company_code = ?",
+            "fmv.year = ?",
+            "fmv.quarter = ?",
+            "fmv.period_start >= ?",
+            "(fmv.period_end = ? OR fmv.period_end IS NULL)",
+        ]
+        params = [company_code, year, quarter, f"{year}-01-01", single_end]
 
         if fields:
             ph = ",".join("?" * len(fields))
@@ -306,8 +336,17 @@ def get_trend_data(
             if not parsed:
                 return json.dumps({"error": f"No periods found for {company_code}"})
 
-            period_filter = " OR ".join(["(fmv.year = ? AND fmv.quarter = ?)"] * len(parsed))
-            period_params = [v for yq in parsed for v in yq]
+            # Build per-period clauses that also pin the period dates, so we
+            # never pick prior-year comparatives or the YTD duplicate.
+            clauses, period_params = [], []
+            for (yy, qq) in parsed:
+                s_start, s_end, _, _ = period_bounds(yy, qq)
+                clauses.append(
+                    "(fmv.year = ? AND fmv.quarter = ? "
+                    "AND fmv.period_start = ? AND fmv.period_end = ?)"
+                )
+                period_params.extend([yy, qq, s_start, s_end])
+            period_filter = " OR ".join(clauses)
             ph = ",".join("?" * len(fields))
             field_params = fields + fields
 
@@ -357,6 +396,7 @@ def compare_companies(company_codes: list, field: str, period: str) -> str:
     """
     try:
         year, quarter = parse_period(period)
+        single_start, single_end, _, _ = period_bounds(year, quarter)
         ph = ",".join("?" * len(company_codes))
         sql = f"""
             SELECT fmv.company_code, fd.zh_name, fd.canonical_name,
@@ -365,10 +405,11 @@ def compare_companies(company_codes: list, field: str, period: str) -> str:
             JOIN field_dictionary fd ON fmv.field_id = fd.field_id
             WHERE fmv.company_code IN ({ph})
               AND fmv.year = ? AND fmv.quarter = ?
+              AND fmv.period_start = ? AND fmv.period_end = ?
               AND (fd.canonical_name = ? OR fd.zh_name = ?)
             ORDER BY CAST(fmv.value AS REAL) DESC
         """
-        params = company_codes + [year, quarter, field, field]
+        params = company_codes + [year, quarter, single_start, single_end, field, field]
         with get_db() as conn:
             cur = conn.cursor()
             cur.execute(sql, params)
