@@ -1,13 +1,25 @@
+# AITC Credit Investigation Chatbot
+# Core dependencies — pin versions before production deployment
+
+# API server
 fastapi
-uvicorn 
-langchain
-langchain_community
-langchain_openai
-langchain-ollama
-langchain_text_splitters
-langchain_chroma
-langchain_ollama
-langchain_core
-langchain-anthropic
+uvicorn[standard]
+
+# LangGraph agent framework
 langgraph
-rpds-py
+langchain-core
+langchain-community
+langchain-openai       # ChatOpenAI client — points at local vLLM endpoint
+langchain-text-splitters
+langchain-chroma       # vector store for candidate search
+
+# Embeddings (pick one based on your setup)
+langchain-ollama       # if using Ollama for embeddings
+# langchain-anthropic  # not active — cloud path not yet wired
+
+# Utilities
+python-dotenv          # .env file loading
+pydantic               # schema validation in exact_query.py
+
+# Note: sqlite3 is built-in — no install needed
+# Note: mcp-server has its own requirements.txt under mcp-server/
