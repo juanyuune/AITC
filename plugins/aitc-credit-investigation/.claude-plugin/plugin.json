@@ -1,7 +1,7 @@
 {
   "name": "aitc-credit-investigation",
-  "version": "1.0.0",
-  "description": "AITC 台灣信用調查 AI 助手 — 查詢台灣 FSC XBRL 財務資料、計算財務比率、分析多季趨勢、生成完整信用調查報告。全程在地端 DGX Spark 執行，資料不離境。",
+  "version": "2.0.0",
+  "description": "AITC 台灣信用調查 AI 助手 — 查詢台灣 FSC XBRL 財務資料、計算財務比率、分析多季趨勢、同業比較、生成完整信用調查報告。全程在地端 DGX Spark 執行，資料不離境。適用情境：信用調查分析師需要快速取得台灣上市公司財務數據、風險評估、或生成完整徵信報告時使用。",
   "author": {
     "name": "AITC AI Development Team"
   }

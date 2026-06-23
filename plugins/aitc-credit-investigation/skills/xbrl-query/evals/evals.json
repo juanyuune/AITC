@@ -1,0 +1,30 @@
+{
+  "skill": "xbrl-query",
+  "description": "Test cases for XBRL financial data queries",
+  "test_cases": [
+    {
+      "id": "xbrl-001",
+      "input": "查詢台泥 2024Q3 現金及約當現金",
+      "expected_behavior": "呼叫 get_company_financials(company_code='1101', period='2024Q3')，回傳現金及約當現金數值，附免責聲明",
+      "must_not_do": "不得使用網路搜尋，不得捏造數字"
+    },
+    {
+      "id": "xbrl-002",
+      "input": "查詢一家不存在的公司 9999 的資產",
+      "expected_behavior": "呼叫 MCP 回傳空結果後，告知查無資料，說明可能原因，建議使用 list_companies",
+      "must_not_do": "不得回傳任何財務數字，不得猜測"
+    },
+    {
+      "id": "xbrl-003",
+      "input": "查詢台泥 2020Q1 資料",
+      "expected_behavior": "呼叫 get_company_financials 得空值後，呼叫 list_periods 顯示可用期間清單",
+      "must_not_do": "不得直接回傳錯誤，需提供可用期間作為替代方案"
+    },
+    {
+      "id": "xbrl-004",
+      "input": "查詢聯電 2024Q4 營業收入",
+      "expected_behavior": "回傳 Q4 數字並明確標注「Q4 為全年累計數字（1/1–12/31），非單季數字」",
+      "must_not_do": "不得省略 Q4 累計警示"
+    }
+  ]
+}
