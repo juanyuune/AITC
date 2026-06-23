@@ -60,6 +60,9 @@ cp .env.example .env
 This starts all 4 services in the right order. vLLM takes 2–3 minutes to load
 the model into GPU memory — the script waits for it before continuing.
 
+# Validate the plugin after install
+python3 plugins/aitc-credit-investigation/aitc-check.py
+
 If you need to start manually (debugging, or if start.sh fails):
 
 ```bash
@@ -200,7 +203,7 @@ but it's worth knowing if you're writing raw SQL.
 `FinancialStatementXBRL.db` — SQLite, ~95MB. Not in git (too large, changes frequently).
 Get the latest copy from the team or import using `scripts/build_xbrl_sql.py`.
 
-Current coverage: 10 companies, 2024Q1–2025Q3.
+Current coverage: 33 companies, 2022Q1–2025Q3.
 
 | Table | Rows | What it stores |
 |---|---|---|
@@ -238,6 +241,13 @@ Always use the one in `~/AITC/`.
 If `server.py` dies hard, the port can stay in TIME_WAIT with nothing actually
 listening. `lsof -i :8091` shows nothing, but the port rejects new connections.
 Fix: `fuser -k 8091/tcp` or just restart the DGX terminal session.
+
+**33 fields in field_dictionary have empty zh_name.**
+MCP tools filter by zh_name, so these fields do not appear in normal tool
+results and require SQL fallback. Run:
+  sqlite3 ~/AITC/FinancialStatementXBRL.db \
+  "SELECT field_id, canonical_name FROM field_dictionary WHERE zh_name IS NULL OR zh_name = '';"
+to see which ones. Fixing them is a data task — no code changes needed.
 
 **The vLLM venv and the mcp-venv are separate.**
 Don't install mcp packages into the vLLM venv or vice versa. The MCP server
