@@ -218,3 +218,4 @@ node_modules/
 # ZIP files
 *.zip
 src/services/xbrl_embeddings_cache_ollama.json
+*.bak
