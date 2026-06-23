@@ -1,6 +1,10 @@
 ---
 name: trend-analysis
-description: Analyze multi-quarter trends for a Taiwan-listed company, computing QoQ and YoY correctly. Use whenever a user asks about growth, trajectory, or "how have the last few quarters looked". Triggers 趨勢, 走勢, 是否成長, 成長了多少, 年增率, 季增率, YoY, QoQ, 連續幾季, 最近幾季, 多季比較, 全年走勢, 歷史數字, 最近表現如何, 這幾季怎樣. Critically, Q4 income/cash-flow figures are cumulative full-year, so single-quarter Q4 must be derived (full-year − Q1 − Q2 − Q3) and marked as an estimate before any QoQ; prefer YoY to avoid the Q4 format trap.
+description: |
+  分析台灣上市公司多季財務數據走勢，計算季增率與年增率。
+  觸發關鍵字：趨勢、走勢、是否成長、成長了多少、年增率、季增率、
+  YoY、QoQ、連續幾季、最近幾季、多季比較、全年走勢、歷史數字。
+  也在使用者說「最近表現如何」「這幾季怎樣」時啟用。
 ---
 
 # 多季趨勢分析

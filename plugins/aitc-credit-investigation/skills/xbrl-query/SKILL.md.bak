@@ -1,6 +1,11 @@
 ---
 name: xbrl-query
-description: Retrieve a precise XBRL financial figure for a Taiwan-listed company and period via the xbrl-taiwan MCP. Use for any single-value lookup of a financial line item plus a period. Triggers 查詢, 多少, 幾億, 現金水位, 應收帳款, 存貨, 營業收入, 淨利, EPS, 資產, 負債, plus any account name combined with a period (Q1/Q2/Q3/Q4). Maps colloquial Chinese (現金水位 → 現金及約當現金) to dictionary fields, confirms available periods with list_periods first, and flags Q4 as cumulative full-year. Do not use for trends (trend-analysis), ratios (ratio-analysis), peer comparison (peer-comparison), or full reports (credit-memo).
+description: |
+  查詢台灣上市公司 XBRL 財務報表的精確數值，使用 xbrl-taiwan MCP。
+  觸發關鍵字：查詢、多少、幾億、現金水位、應收帳款、存貨、營業收入、
+  淨利、EPS、資產、負債，以及任何財務科目名稱加上期間（Q1/Q2/Q3/Q4）。
+  不適用：多季趨勢（用 trend-analysis）、比率計算（用 ratio-analysis）、
+  同業比較（用 peer-comparison）、完整報告（用 credit-memo）。
 ---
 
 # XBRL 財務數字查詢

@@ -1,6 +1,10 @@
 ---
 name: data-sources
-description: Authoritative data-sourcing rules for AITC Taiwan credit investigation — always query the xbrl-taiwan MCP first, never use web search for financial figures, say 查無資料 rather than estimate, and attach the human-review disclaimer to every financial output. Auto-activates on ANY question touching a Taiwan-listed company's financial figures, even vague ones. Triggers 股票代碼, 財報, 營收, EPS, 資產, 負債, 現金, 比率, 季報, 年報, XBRL, 信用調查, any company name or 4-digit stock code. Also encodes the Q4-cumulative rule and the 歸屬母公司業主 net-income convention.
+description: |
+  資料來源優先順序規則。每當使用者詢問台灣上市公司任何財務數字時自動啟用。
+  觸發關鍵字：股票代碼、財報、營收、EPS、資產、負債、現金、比率、季報、
+  年報、XBRL、信用調查、任何公司名稱或四位數股票代碼。
+  即使問題很模糊（「這家公司怎樣？」），只要涉及財務數字就啟用。
 ---
 
 # 資料來源規則

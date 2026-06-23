@@ -1,6 +1,10 @@
 ---
 name: cash-flow
-description: Analyze a Taiwan-listed company's cash-flow statement to judge earnings quality and liquidity — operating/investing/financing flows, free cash flow, and whether the core business self-funds or burns cash. Use whenever a user asks about cash flow, capex, free cash flow, or "is this company burning cash". Triggers 現金流量, 營業現金流, 投資現金流, 籌資現金流, 自由現金流, 資本支出, FCF, 燒錢速度, 現金是否夠用, CF, 公司有沒有在燒錢, 現金怎麼用的. Always treat Q4 figures as cumulative full-year, not standalone Q4.
+description: |
+  分析台灣上市公司現金流量表，評估現金產生能力與資金運用。
+  觸發關鍵字：現金流量、營業現金流、投資現金流、籌資現金流、
+  自由現金流、資本支出、FCF、燒錢速度、現金是否夠用、CF。
+  也在使用者問「公司有沒有在燒錢」「現金怎麼用的」時啟用。
 ---
 
 # 現金流量表分析

@@ -1,6 +1,11 @@
 ---
 name: balance-sheet
-description: Analyze a Taiwan-listed company's balance sheet to assess financial-structure soundness and credit risk — cash position vs short-term debt, leverage, debt-maturity concentration, and equity erosion. Use whenever a user asks about a company's assets, liabilities, or equity, or asks a vague "how is this company's financial health" question. Triggers 資產, 負債, 股東權益, 現金水位, 應收帳款, 存貨, 流動資產, 流動負債, 長期借款, 應付帳款, 淨值, 負債比率, 自有資本率, 財務結構, 資產負債表, BS, 公司財務狀況如何, 財務體質怎樣. Do not use for cash flow (use cash-flow), ratios (use ratio-analysis), or multi-quarter trends (use trend-analysis).
+description: |
+  分析台灣上市公司資產負債表，評估財務結構健全度。
+  觸發關鍵字：資產、負債、股東權益、現金水位、應收帳款、存貨、
+  流動資產、流動負債、長期借款、應付帳款、淨值、負債比率、
+  自有資本率、財務結構、資產負債表、BS，以及
+  「公司財務狀況如何」「財務體質怎樣」這類模糊問題。
 ---
 
 # 資產負債表分析

@@ -1,6 +1,10 @@
 ---
 name: peer-comparison
-description: Benchmark the same financial metric across multiple Taiwan-listed companies to place a target company within its industry. Use whenever a user wants a peer or competitor comparison or an industry ranking. Triggers 同業比較, 競爭對手, 行業排名, 相比之下, 比較, 哪家比較好, 對手, 同行, peer comparison, benchmarking, 和其他公司比起來怎麼樣. Prefers compare_companies in a single call; never compares ratios across different industries (e.g. cement vs semiconductor) and clearly marks no-data companies as 未入庫 vs 此期間無申報.
+description: |
+  比較多家台灣上市公司同一財務指標，進行同業標竿分析。
+  觸發關鍵字：同業比較、競爭對手、行業排名、相比之下、比較、
+  哪家比較好、對手、同行、peer comparison、benchmarking，
+  以及「和其他公司比起來怎麼樣」。
 ---
 
 # 同業比較分析

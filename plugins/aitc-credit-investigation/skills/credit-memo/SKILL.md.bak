@@ -1,6 +1,10 @@
 ---
 name: credit-memo
-description: Generate a full Taiwan-listed-company credit-investigation report integrating four-quarter financials, ratios, trends, and a traffic-light risk assessment for analyst review. Use for any request for a complete 信用調查 / 徵信 report, and proactively offer it when a user says "take a look at this company for me". Triggers 信用調查, 徵信報告, 完整報告, credit report, 全面分析, 幫我做個報告, credit-report, 幫我看一下這家公司. Always ends with the mandatory human-review disclaimer; never omit any of the six sections or the Q4-cumulative note.
+description: |
+  生成完整的台灣上市公司信用調查報告，整合財務數字、比率、趨勢、風險評估。
+  觸發關鍵字：信用調查、徵信報告、完整報告、credit report、全面分析、
+  幫我做個報告，以及 credit-report 指令。
+  也在使用者說「幫我看一下這家公司」時，主動詢問是否需要完整報告。
 ---
 
 # 信用調查報告生成

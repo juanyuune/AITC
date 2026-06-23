@@ -1,6 +1,10 @@
 ---
 name: company-profile
-description: Look up a Taiwan-listed company's basic profile and confirm what the XBRL database actually contains (coverage, available periods, industry, consolidated vs parent-only). Use this FIRST whenever a user gives a company name but no stock code, or asks "do you have data on…", "which quarters can I query", or "which industry is this". Triggers 公司是哪家, 有沒有資料, 可以查哪幾季, 產業別, 是哪個產業, 合併報表還是個別, 資料庫有沒有這家公司, 幫我確認一下. Resolves Chinese name variants (台灣水泥 / 台泥 / 臺泥) to the correct stock code before any downstream query.
+description: |
+  查詢台灣上市公司基本資料與資料庫收錄狀況。
+  觸發關鍵字：公司是哪家、有沒有資料、可以查哪幾季、產業別、
+  是哪個產業、合併報表還是個別、資料庫有沒有這家公司、幫我確認一下。
+  也在使用者只知道公司名稱但未提供股票代碼時啟用。
 ---
 
 # 公司基本資料查詢

@@ -1,6 +1,10 @@
 ---
 name: ratio-analysis
-description: Calculate a Taiwan-listed company's key financial ratios from raw XBRL figures and judge health against Taiwan industry benchmarks. Always pull raw numbers via MCP first and show the calculation basis — never estimate or recall a ratio from memory. Use whenever a user asks about any financial ratio or "is this company healthy". Triggers 負債比率, 流動比率, 速動比率, 毛利率, 淨利率, ROE, ROA, 週轉率, 利息保障倍數, 財務比率, 比率分析, 是否健康, 財務體質. Marks a ratio as 資料不足 when XBRL omits the line item (e.g. UMC's current assets) instead of guessing, and flags non-manufacturing industries where benchmarks differ.
+description: |
+  計算台灣上市公司財務比率，依台灣產業標準判斷健康區間。
+  觸發關鍵字：負債比率、流動比率、速動比率、毛利率、淨利率、
+  ROE、ROA、週轉率、利息保障倍數、財務比率、比率分析、是否健康、財務體質。
+  必須先用 MCP 取得原始數字，再計算比率。不得使用任何估算或記憶中的比率。
 ---
 
 # 財務比率分析

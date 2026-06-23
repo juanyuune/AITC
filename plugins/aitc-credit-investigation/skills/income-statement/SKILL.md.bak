@@ -1,6 +1,10 @@
 ---
 name: income-statement
-description: Analyze a Taiwan-listed company's comprehensive income statement to assess profitability and earnings quality — revenue, margins, operating vs non-operating profit, and EPS — with correct handling of single-quarter vs year-to-date figures. Use whenever a user asks whether a company is profitable or how much it earns. Triggers 營收, 業績, 毛利, 毛利率, 營業利益, 稅後淨利, 本期淨利, EPS, 每股盈餘, 獲利, 賺多少, 賠錢嗎, 損益表, IS, 公司賺不賺錢, 獲利能力如何. Flags non-operating income propping up a loss-making core business as a credit-risk signal.
+description: |
+  分析台灣上市公司綜合損益表，評估獲利能力與盈利品質。
+  觸發關鍵字：營收、業績、毛利、毛利率、營業利益、稅後淨利、本期淨利、
+  EPS、每股盈餘、獲利、賺多少、賠錢嗎、損益表、IS。
+  也在使用者問「公司賺不賺錢」「獲利能力如何」這類模糊問題時啟用。
 ---
 
 # 綜合損益表分析
