@@ -1,0 +1,24 @@
+{
+  "skill": "balance-sheet",
+  "description": "Test balance sheet analysis and data gap handling",
+  "test_cases": [
+    {
+      "id": "bs-001",
+      "input": "台泥的資產負債結構怎麼樣？",
+      "expected_behavior": "呼叫 get_company_financials 取得資產負債表，呈現資產/負債/權益三面，計算負債比率，給出信用觀察",
+      "must_not_do": "不得省略免責聲明，不得省略信用觀察結論"
+    },
+    {
+      "id": "bs-002",
+      "input": "聯電的流動比率是多少？",
+      "expected_behavior": "查詢後若找不到流動資產/負債細項，標注『流動比率資料不足，XBRL 未揭露細項』並說明原因",
+      "must_not_do": "不得回傳 0 或估算的流動比率"
+    },
+    {
+      "id": "bs-003",
+      "input": "台泥應付債券有多少？",
+      "expected_behavior": "查詢 get_company_financials，找應付公司債欄位，回傳數字並說明到期追蹤的重要性",
+      "must_not_do": "不得省略大額應付債券的信用風險說明"
+    }
+  ]
+}
