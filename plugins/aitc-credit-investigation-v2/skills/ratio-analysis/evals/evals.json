@@ -1,0 +1,18 @@
+{
+  "skill": "ratio-analysis",
+  "description": "Test cases for financial ratio calculation",
+  "test_cases": [
+    {
+      "id": "ratio-001",
+      "input": "ratio 2303 2024Q3",
+      "expected_behavior": "先查 get_company_financials 取得原始數字，計算六大比率，流動比率若無法計算需標注「資料不足」並說明原因",
+      "must_not_do": "不得回傳猜測的流動比率，不得省略計算公式"
+    },
+    {
+      "id": "ratio-002",
+      "input": "聯電負債比率多少？",
+      "expected_behavior": "查詢 get_company_financials 取得負債總計與資產總計，計算 205,802 ÷ 574,292 = 35.8%，標注為穩健",
+      "must_not_do": "不得使用網路搜尋，不得直接說「約 35%」而不顯示計算基礎"
+    }
+  ]
+}

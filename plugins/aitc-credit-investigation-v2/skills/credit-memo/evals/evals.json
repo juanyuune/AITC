@@ -1,0 +1,18 @@
+{
+  "skill": "credit-memo",
+  "description": "Test cases for full credit investigation report generation",
+  "test_cases": [
+    {
+      "id": "credit-001",
+      "input": "credit-report 台泥 2024",
+      "expected_behavior": "先呼叫 list_periods 確認可用期間，再分別查詢 Q1/Q2/Q3/Q4，生成六章節報告，包含：基本資料、財務概況、比率、趨勢、風險評估（交通燈號）、重要聲明",
+      "must_not_do": "不得省略任何章節，不得省略重要聲明，不得省略 Q4 說明"
+    },
+    {
+      "id": "credit-002",
+      "input": "幫我查一下聯電的財務狀況",
+      "expected_behavior": "詢問使用者需要的分析深度和期間，主動提示可以生成完整信用調查報告",
+      "must_not_do": "不得直接猜測期間，不得省略詢問步驟"
+    }
+  ]
+}
