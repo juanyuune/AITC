@@ -15,6 +15,7 @@ from src.providers.chat_openAI_provider import chat_model, get_message_text
 from src.services.account_title_matcher import find_candidates, search_item_source_paths
 from src.types.langgraph_state_types import OverallState
 from src.services.vector_candidate_search import vector_find_candidates
+from src.services.concept_map import lookup_concept as _concept_map_lookup
 
 
 logger = logging.getLogger(__name__)
@@ -188,21 +189,160 @@ def resolve_company_profile(company_code: str) -> Dict[str, Optional[str]]:
         connection.close()
 
 
-def extract_question_schema(question: str) -> Dict:
-    parser = JsonOutputParser(pydantic_object=QuestionSchema)
-    prompt = PromptTemplate(
-        template="""盡可能回覆問題，並組成指定格式。無法取得資訊的欄位填入空字串。
-companyName 一定要從問題中取出文字代入。
-quarter 請回傳 1 到 4 的整數。
+def _build_company_lookup():
+    """Build company name/code → company dict for fast lookup."""
+    lookup = {}
+    for item in CompanyStockCodeArray:
+        for field in ["companyCode", "companyName", "shortName", "englishName"]:
+            val = item.get(field, "").strip()
+            if val:
+                lookup[val] = item
+                if "台" in val:
+                    lookup[val.replace("台", "臺")] = item
+                if "臺" in val:
+                    lookup[val.replace("臺", "台")] = item
+    return lookup
 
+_COMPANY_LOOKUP = _build_company_lookup()
+
+def _extract_company_from_text(text: str) -> Optional[Dict]:
+    """Rule-based company extraction from question text."""
+    # Remove year/quarter patterns before matching to avoid 2024 → companyCode
+    clean_text = re.sub(r"20\d{2}\s*年", "", text)
+    clean_text = re.sub(r"[Qq][1-4]", "", clean_text)
+    clean_text = re.sub(r"第[一二三四]季", "", clean_text)
+    # Try direct lookup first (longest match wins)
+    best = None
+    best_len = 0
+    for name, item in _COMPANY_LOOKUP.items():
+        if name in clean_text and len(name) > best_len:
+            best = item
+            best_len = len(name)
+    return best
+
+def _extract_period_from_text(text: str) -> Dict:
+    """Rule-based year/quarter extraction."""
+    year = None
+    quarter = None
+    # Year: 2024年, 2023年, etc.
+    year_match = re.search(r"(20\d{2})\s*年", text)
+    if year_match:
+        year = int(year_match.group(1))
+    # Quarter: Q1, Q2, Q3, Q4, 第一季, 第二季, etc.
+    q_match = re.search(r"Q([1-4])", text, re.IGNORECASE)
+    if q_match:
+        quarter = int(q_match.group(1))
+    else:
+        chi_q = {"第一季": 1, "第二季": 2, "第三季": 3, "第四季": 4,
+                 "一季": 1, "二季": 2, "三季": 3, "四季": 4}
+        for kw, q in chi_q.items():
+            if kw in text:
+                quarter = q
+                break
+    return {"year": year, "quarter": quarter, "range": None}
+
+def _extract_fields_from_text(text: str) -> List[Dict]:
+    """Rule-based financial field extraction from question text."""
+    # Known financial field patterns (order matters — longer first)
+    FIELD_PATTERNS = [
+        "現金及約當現金", "現金水位", "現金部位", "應收帳款淨額", "應收帳款", "應收票據",
+        "存貨", "流動資產", "非流動資產", "資產總額", "資產總計", "總資產",
+        "流動負債", "非流動負債", "負債總額", "負債總計", "總負債",
+        "權益總額", "權益總計", "股東權益",
+        "營業收入", "營收", "毛利", "毛利率",
+        "營業費用", "營業利益", "營業利潤",
+        "稅前淨利", "稅後淨利", "本期淨利", "淨利",
+        "每股盈餘", "現金流量", "營業活動現金流",
+        "應付帳款", "短期借款", "長期借款",
+        "不動產廠房及設備", "無形資產",
+    ]
+    found = []
+    seen = set()
+    for pattern in FIELD_PATTERNS:
+        if pattern in text and pattern not in seen:
+            found.append({"field": pattern, "category": None})
+            seen.add(pattern)
+    return found
+
+def extract_question_schema(question: str) -> Dict:
+    """
+    Rule-based question schema extraction — no LLM needed.
+    Replaces unreliable Breeze2 JSON parsing with deterministic rules.
+    """
+    print(f"[exact_query] rule-based extract_question_schema for: {question}")
+
+    # Extract company
+    company = _extract_company_from_text(question)
+    company_name = company.get("companyName", "") if company else ""
+    company_code = company.get("companyCode", "") if company else ""
+    short_name = company.get("shortName", "") if company else ""
+    english_name = company.get("englishName", "") if company else ""
+
+    # Extract period
+    period = _extract_period_from_text(question)
+
+    # Extract fields
+    fields = _extract_fields_from_text(question)
+
+    # Fallback to LLM only if rules completely fail
+    if not fields:
+        print("[exact_query] rule-based: no fields found, falling back to LLM")
+        from langchain_core.runnables import RunnableLambda
+        parser = JsonOutputParser(pydantic_object=QuestionSchema)
+        prompt = PromptTemplate(
+            template="""只輸出 JSON，不要任何說明文字。
 問題：{question}
 格式：{format_instructions}""",
-        input_variables=["question"],
-        partial_variables={"format_instructions": parser.get_format_instructions()},
-    )
-    print("[exact_query] extract_question_schema prompt:\n" + prompt.format(question=question))
-    chain = prompt | chat_model | parser
-    return chain.invoke({"question": question})
+            input_variables=["question"],
+            partial_variables={"format_instructions": parser.get_format_instructions()},
+        )
+        def extract_json(message):
+            text = message.content if hasattr(message, "content") else str(message)
+            text = re.sub(r"```[a-z]*\s*", "", text).strip()
+            start = text.find("{")
+            if start != -1:
+                depth = 0
+                for i, ch in enumerate(text[start:], start):
+                    if ch == "{": depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            return text[start:i+1]
+            if "companyName" in text or "CompanyName" in text:
+                return "{" + text + "}"
+            return text
+        try:
+            result = (prompt | chat_model | RunnableLambda(extract_json) | parser).invoke({"question": question})
+            return result
+        except Exception as e:
+            print(f"[exact_query] LLM fallback also failed: {e}")
+            return {"companyName": "", "companyCode": "", "shortName": "",
+                    "englishName": "", "period": period, "requested_fields": []}
+
+    # Normalize field names to match XBRL dictionary zh_names
+    FIELD_NORMALIZE = {
+        "現金水位": "現金及約當現金",
+        "現金部位": "現金及約當現金",
+        "負債總額": "負債總計",
+        "總負債": "負債總計",
+        "資產總額": "資產總計",
+        "總資產": "資產總計",
+        "權益總額": "權益總計",
+    }
+    for f in fields:
+        if f["field"] in FIELD_NORMALIZE:
+            f["field"] = FIELD_NORMALIZE[f["field"]]
+
+    schema = {
+        "companyName": company_name,
+        "companyCode": company_code,
+        "shortName": short_name,
+        "englishName": english_name,
+        "period": period,
+        "requested_fields": fields,
+    }
+    print(f"[exact_query] rule-based schema: company={company_code} period={period} fields={[f['field'] for f in fields]}")
+    return schema
 
 
 def filter_candidates(candidates: List[Dict]) -> List[Dict]:
@@ -289,6 +429,21 @@ def get_candidates_with_fallback(
     company_code: Optional[str] = None,
     industry_type: Optional[str] = None,
 ) -> List[Dict]:
+    # ── Concept map fast path ──────────────────────────────────
+    # Direct lookup bypasses vector search for known financial terms
+    mapped = _concept_map_lookup(field_name)
+    if mapped:
+        concept_id, mapped_statement_type = mapped
+        print(f"[exact_query] concept_map hit for '{field_name}' → {concept_id} ({mapped_statement_type})")
+        return [{
+            "concept_name": concept_id,
+            "statement_type": mapped_statement_type,
+            "zh_tw": field_name,
+            "en": concept_id.split("_")[-1] if "_" in concept_id else concept_id,
+            "code": None,
+            "score": 100.0,
+            "mapped_from": field_name,
+        }]
     """
     Try vector search first (semantic meaning-based matching).
     Fall back to keyword matching if cache is empty or embedding fails.
@@ -389,11 +544,30 @@ def build_statement_type_candidates(
     deduped_candidates.sort(
         key=lambda item: (
             -float(item.get("score") or 0),
+            1 if (item.get("concept_name") or "").endswith("Abstract") else 0,
+            0 if item.get("code") else 1,
             item.get("statement_type") or "",
-            item.get("code") or "",
             item.get("concept_name") or "",
         )
     )
+
+    # ── Filter: remove candidates semantically mismatched to field_name ──
+    # Prevents 資產總計 from being selected for 負債總計 query when both score=100
+    def is_semantic_match(candidate: Dict, field: str) -> bool:
+        zh = candidate.get("zh_tw") or ""
+        concept = candidate.get("concept_name") or ""
+        # Hard exclusions: if field contains 負債 but candidate is 資產 (and vice versa)
+        if "負債" in field and "資產" in zh and "負債" not in zh:
+            return False
+        if "資產" in field and "負債" in zh and "資產" not in zh:
+            return False
+        if "負債" in field and "Equity" in concept and "Liabilit" not in concept:
+            return False
+        if "權益" in field and "Liabilit" in concept:
+            return False
+        return True
+
+    deduped_candidates = [c for c in deduped_candidates if is_semantic_match(c, field_name)]
 
     # ── Apply confidence threshold ─────────────────────────────
     # Remove low-score candidates before they reach LLM selection.
@@ -648,7 +822,14 @@ def exact_query(state: OverallState) -> OverallState:
         return {
             **state,
             "answer": "無法從問題中辨識要查詢的財務欄位。",
+            "retrieved_sources": ["FinancialStatementXBRL.db"],
         }
+
+    # If no quarter specified, expand to all 4 quarters for trend analysis
+    if schema.get("period", {}).get("quarter") is None and schema.get("period", {}).get("year"):
+        year = schema["period"]["year"]
+        schema["_all_quarters"] = True
+        print(f"[exact_query] no quarter specified — will fetch all quarters for {year}")
 
     state_statement_types = normalize_statement_types(state.get("statement_types", []))
     statement_type_result = state.get("statement_type_result", {})
@@ -788,12 +969,32 @@ def exact_query(state: OverallState) -> OverallState:
             continue
 
         step_started_at = perf_counter()
-        answer_data, resolved_candidate, attempt_logs = resolve_answer_data(
-            schema=schema,
-            company_profile=company_profile,
-            selected_candidate=selected_candidate,
-            candidates=candidates,
-        )
+        # If no quarter specified, fetch all 4 quarters
+        if schema.get("_all_quarters"):
+            all_quarter_data = []
+            for q in [1, 2, 3, 4]:
+                q_schema = {**schema, "period": {**schema["period"], "quarter": q}}
+                q_data, q_candidate, _ = resolve_answer_data(
+                    schema=q_schema,
+                    company_profile=company_profile,
+                    selected_candidate=selected_candidate,
+                    candidates=candidates,
+                )
+                if q_data:
+                    all_quarter_data.append({"quarter": q, "data": q_data})
+            # Use the first found as answer_data, store all in resolved_candidate
+            answer_data = all_quarter_data[0]["data"] if all_quarter_data else None
+            resolved_candidate = selected_candidate
+            attempt_logs = []
+            if all_quarter_data:
+                resolved_candidate = {**selected_candidate, "_all_quarter_data": all_quarter_data}
+        else:
+            answer_data, resolved_candidate, attempt_logs = resolve_answer_data(
+                schema=schema,
+                company_profile=company_profile,
+                selected_candidate=selected_candidate,
+                candidates=candidates,
+            )
         print(
             f"[timing] exact_query.resolve_answer_data took {perf_counter() - step_started_at:.3f}s "
             f"(field={target_field})"
@@ -852,14 +1053,22 @@ def exact_query(state: OverallState) -> OverallState:
                 }
             )
 
+    # Expand multi-quarter results for display
+    for item in field_results:
+        candidate = item.get("selected_candidate", {})
+        all_q = candidate.get("_all_quarter_data", [])
+        if all_q:
+            item["all_quarter_data"] = all_q
+
     resolved_field_results = [
         item for item in field_results
-        if item.get("answer_data") is not None
+        if item.get("answer_data") is not None or item.get("all_quarter_data")
     ]
     if not resolved_field_results:
         return {
             **state,
             "answer": "已完成欄位比對，但目前查無可回覆的財務數值。",
+            "retrieved_sources": ["FinancialStatementXBRL.db"],
             "reference_data": {
                 "schema": schema,
                 "company_profile": company_profile,
@@ -894,7 +1103,12 @@ def exact_query(state: OverallState) -> OverallState:
 整體報表分類：{state_statement_types or statement_type_result.get('statement_types', [])}
 
 ### 各欄位查詢結果
-{dump_log_payload(resolved_field_results)}
+{dump_log_payload([
+    {**r, "selected_candidate": {
+        **r["selected_candidate"],
+        "_all_quarter_data": r["selected_candidate"].get("_all_quarter_data", [])
+    }} for r in resolved_field_results
+])}
 
 ### 未查得欄位
 {dump_log_payload(unresolved_fields)}

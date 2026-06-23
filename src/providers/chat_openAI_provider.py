@@ -1,40 +1,24 @@
 import os
+import re
 from dotenv import load_dotenv
 from langchain_core.messages import BaseMessage
-from langchain_ollama import ChatOllama
+from langchain_openai import ChatOpenAI
 
 load_dotenv()
 
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://192.168.1.102:11434")
-OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "gemma4:31b")
+VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://localhost:8080/v1")
+VLLM_MODEL    = os.getenv("VLLM_MODEL", "/home/user/models/breeze2-8b")
 
-chat_model = ChatOllama(
-    model=OLLAMA_MODEL,
-    base_url=OLLAMA_BASE_URL,
-    temperature=float(os.getenv("OLLAMA_TEMPERATURE", "0.1")),
-    num_ctx=int(os.getenv("OLLAMA_NUM_CTX", "16384")),
-    top_k=int(os.getenv("OLLAMA_TOP_K", "20")),
-    top_p=float(os.getenv("OLLAMA_TOP_P", "0.9")),
-    repeat_penalty=float(os.getenv("OLLAMA_REPEAT_PENALTY", "1.1")),
+chat_model = ChatOpenAI(
+    model=VLLM_MODEL,
+    base_url=VLLM_BASE_URL,
+    api_key="dummy",
+    temperature=float(os.getenv("VLLM_TEMPERATURE", "0.1")),
+    max_tokens=int(os.getenv("VLLM_MAX_TOKENS", "2048")),
 )
 
 def get_message_text(message: BaseMessage) -> str:
-    return message.content.strip()
-
-#---
-#import os
-#from dotenv import load_dotenv
-#from langchain_core.messages import BaseMessage
-#from langchain_openai import ChatOpenAI
-
-#load_dotenv()
-
-#chat_model = ChatOpenAI(
-#    model=os.getenv("OPENAI_MODEL_NAME", "gpt-5.5"),
-#    api_key=os.getenv("OPENAI_API_KEY"),
-#    temperature=0.1,
-#)
-
-#def get_message_text(message: BaseMessage) -> str:
-#    return message.content.strip()
-#-----
+    text = message.content.strip()
+    # Strip any thinking blocks if present
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    return text

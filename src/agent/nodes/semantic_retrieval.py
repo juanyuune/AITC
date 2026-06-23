@@ -14,6 +14,7 @@ from src.providers.chat_openAI_provider import chat_model, get_message_text
 from src.services.account_title_matcher import find_candidates
 from src.types.langgraph_state_types import OverallState
 from src.services.vector_candidate_search import vector_find_candidates
+from src.services.concept_map import lookup_concept as _concept_map_lookup
 
 
 logger = logging.getLogger(__name__)
@@ -250,6 +251,31 @@ def resolve_company(identifiers: object) -> Optional[Dict]:
                 for value in normalized_values
             ):
                 return item
+
+    # ── Extra: match against companyName directly (handles Breeze2
+    #    returning full name like "士林電機" when shortName is "士電") ──
+    # Known full-name aliases not in CompanyStockCodeArray
+    MANUAL_ALIASES = {
+        "雄獅旅行社": "2731",
+        "晶華酒店":   "2707",
+        "葡萄王生技": "1707",
+        "士林電機":   "1503",
+    }
+    for identifier in candidates:
+        code = MANUAL_ALIASES.get(str(identifier or "").strip())
+        if code:
+            for item in CompanyStockCodeArray:
+                if item.get("companyCode") == code:
+                    return item
+
+    for identifier in candidates:
+        text = str(identifier or "").strip()
+        if len(text) < 2:
+            continue
+        for item in CompanyStockCodeArray:
+            company_name = item.get("companyName", "")
+            if text in company_name or company_name.startswith(text[:4]):
+                return item
     return None
 
 
@@ -364,6 +390,26 @@ def search_candidates_across_statements(
 
     for current_statement_type in target_types:
         chinese_found_any = False
+
+        # ── Concept map fast path ──────────────────────────────
+        for field_query in chinese_queries:
+            mapped = _concept_map_lookup(field_query)
+            if mapped:
+                concept_id, mapped_st = mapped
+                use_st = mapped_st if current_statement_type not in VALID_STATEMENT_TYPES else current_statement_type
+                print(f"[semantic_retrieval] concept_map hit: '{field_query}' → {concept_id}")
+                collected.append({
+                    "concept_name": concept_id,
+                    "statement_type": mapped_st,
+                    "zh_tw": field_query,
+                    "en": concept_id.split("_")[-1] if "_" in concept_id else concept_id,
+                    "code": None,
+                    "score": 100.0,
+                    "matched_query": field_query,
+                    "query_language": "zh",
+                    "mapped_from": field_query,
+                })
+                chinese_found_any = True
 
         # ── Step 1: Chinese queries first ─────────────────────
         for field_query in chinese_queries:
@@ -486,7 +532,8 @@ def fetch_financial_value(
 ) -> Optional[Dict]:
     if statement_type not in VALID_STATEMENT_TYPES:
         return None
-    effective_quarter = 4 if quarter is None else quarter
+    # For annual queries (quarter=None), try Q4 first (year-end), then Q1-Q3
+    quarters_to_try = [4, 3, 2, 1] if quarter is None else [quarter]
 
     connection = sqlite3.connect(DB_PATH)
     connection.row_factory = sqlite3.Row
@@ -536,10 +583,13 @@ def fetch_financial_value(
             ORDER BY
                 CASE WHEN xf.segment_json IS NULL THEN 0 ELSE 1 END,
                 CASE WHEN xf.unit_id = 'TWD' THEN 0 ELSE 1 END,
+                CASE WHEN xf.period_start IS NOT NULL AND xf.period_end IS NOT NULL
+                     AND (julianday(xf.period_end) - julianday(xf.period_start)) <= 100
+                     THEN 0 ELSE 1 END,
                 ABS(fmv.value) DESC
             LIMIT 1
             """,
-            (company_code, year, f"Q{effective_quarter}", concept_id, statement_type),
+            (company_code, year, f"Q{quarters_to_try[0]}", concept_id, statement_type),
         )
         row = cursor.fetchone()
         result = dict(row) if row else None
@@ -633,7 +683,81 @@ def extract_semantic_plan(question: str) -> Dict:
             )
         )
         raise
-    semantic_plan = normalize_semantic_plan(parser.invoke(response))
+
+    # Robust JSON extraction for Breeze2 compatibility
+    raw_text = response.content if hasattr(response, "content") else str(response)
+    raw_text = re.sub(r"```[a-z]*\s*", "", raw_text)
+    raw_text = re.sub(r"```\s*", "", raw_text).strip()
+    # Brace-matching
+    start = raw_text.find("{")
+    if start != -1:
+        depth = 0
+        for i, ch in enumerate(raw_text[start:], start):
+            if ch == "{": depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    raw_text = raw_text[start:i+1]
+                    break
+    elif "company_identifier" in raw_text:
+        raw_text = "{" + raw_text + "}"
+
+    import json as _json
+    try:
+        parsed_dict = _json.loads(raw_text)
+    except Exception:
+        parsed_dict = parser.parse(raw_text)
+    if isinstance(parsed_dict, dict):
+        semantic_plan = normalize_semantic_plan(parsed_dict)
+    else:
+        semantic_plan = normalize_semantic_plan(parsed_dict.model_dump() if hasattr(parsed_dict, "model_dump") else {})
+
+    # ── Fix periods: "各季" → Q1~Q4, no quarter → all quarters ──
+    question_text = semantic_plan.get("company_identifier", "") + " " + str(semantic_plan.get("analysis_goal", ""))
+    original_question = sanitized_question
+    needs_all_quarters = any(kw in original_question for kw in ["各季", "每季", "季趨勢", "季營收"])
+    for req in semantic_plan.get("requirements", []):
+        periods = req.get("periods", [])
+        if needs_all_quarters:
+            # Replace with explicit Q1-Q4
+            years = list({p.get("year") for p in periods if p.get("year")}) or [2024]
+            new_periods = []
+            for y in years:
+                for q in [1, 2, 3, 4]:
+                    new_periods.append({"year": y, "quarter": q})
+            req["periods"] = new_periods
+            print(f"[semantic_retrieval] expanded periods to all quarters: {new_periods}")
+        elif periods and all(p.get("quarter") is None for p in periods):
+            # Annual query — add Q1-Q4 explicitly
+            years = list({p.get("year") for p in periods if p.get("year")}) or [2024]
+            new_periods = []
+            for y in years:
+                for q in [1, 2, 3, 4]:
+                    new_periods.append({"year": y, "quarter": q})
+            req["periods"] = new_periods
+            print(f"[semantic_retrieval] expanded annual periods to quarters: {new_periods}")
+
+    # ── Fix vague field queries from Breeze2 ──────────────────
+    FIELD_QUERY_UPGRADES = {
+        "負債": ["負債總計", "負債合計", "負債總額", "Total liabilities"],
+        "總負債": ["負債總計", "負債合計", "負債總額", "Total liabilities"],
+        "資產": ["資產總計", "資產合計", "資產總額", "Total assets"],
+        "總資產": ["資產總計", "資產合計", "資產總額", "Total assets"],
+        "淨利": ["本期淨利", "本期稅後淨利", "本期損益", "Profit or loss for the period"],
+        "稅後淨利": ["本期淨利", "本期稅後淨利", "本期損益", "Profit or loss for the period"],
+        "稅前淨利": ["稅前損益", "稅前淨利", "繼續營業單位稅前損益", "Profit before tax"],
+        "獲利": ["本期淨利", "本期稅後淨利", "營業利益", "Operating profit"],
+        "收入": ["營業收入", "營收", "總收入", "Revenue"],
+        "營收": ["營業收入", "本期營業收入", "收入", "Revenue"],
+    }
+    for req in semantic_plan.get("requirements", []):
+        fq = req.get("field_query", [])
+        if isinstance(fq, list) and fq:
+            first = fq[0] if fq else ""
+            if first in FIELD_QUERY_UPGRADES:
+                req["field_query"] = FIELD_QUERY_UPGRADES[first]
+                print(f"[semantic_retrieval] upgraded field_query '{first}' → {FIELD_QUERY_UPGRADES[first]}")
+
     return semantic_plan
 
 
@@ -806,10 +930,32 @@ def choose_best_candidates_for_requirement(
     try:
         print("[semantic_retrieval] choose_best_candidates_for_requirement prompt:\n" + prompt)
         response = chat_model.invoke(prompt)
-        parsed = parser.parse(get_message_text(response))
+        raw_choice = get_message_text(response)
+        raw_choice = re.sub(r"```[a-z]*\s*", "", raw_choice)
+        raw_choice = re.sub(r"```\s*", "", raw_choice).strip()
+        start_c = raw_choice.find("{")
+        if start_c != -1:
+            depth_c = 0
+            for i_c, ch_c in enumerate(raw_choice[start_c:], start_c):
+                if ch_c == "{": depth_c += 1
+                elif ch_c == "}":
+                    depth_c -= 1
+                    if depth_c == 0:
+                        raw_choice = raw_choice[start_c:i_c+1]
+                        break
+        import json as _json2
+        try:
+            parsed_obj = _json2.loads(raw_choice)
+            choices_list = parsed_obj.get("choices", []) if isinstance(parsed_obj, dict) else []
+        except Exception:
+            try:
+                parsed_obj = parser.parse(raw_choice)
+                choices_list = parsed_obj.get("choices", []) if isinstance(parsed_obj, dict) else []
+            except Exception:
+                choices_list = []
         choice_map = {
             item.get("field_query"): item.get("concept_name")
-            for item in parsed.get("choices", [])
+            for item in choices_list
             if isinstance(item, dict)
         }
         for task in llm_tasks:
@@ -953,6 +1099,21 @@ def is_candidate_low_confidence(field_query: str, candidate: Dict) -> bool:
 
     if "cash and cash equivalents" in field_text or "現金及約當現金" in field_text:
         if "cashandcashequivalents" not in concept_name.replace(" ", ""):
+            return True
+
+    # Exclude Abstract concepts — they never have data
+    if concept_name.endswith("abstract"):
+        return True
+
+    # Allow P&L concepts through — don't exclude 本期淨利/稅後淨利
+    if any(kw in field_text for kw in ("淨利", "profitloss", "profit loss", "net income")):
+        if any(kw in concept_name for kw in ("ProfitLoss", "NetIncome", "Profit")):
+            return False
+
+    # Exclude obviously wrong matches (薪津 for 淨利 etc)
+    label_zh = str(candidate.get("zh_tw") or "")
+    if any(kw in field_text for kw in ("淨利", "獲利", "profit")):
+        if any(wrong in label_zh for wrong in ("薪津", "薪資", "薪酬", "員工")):
             return True
 
     if "short term debt" in field_text or "short-term debt" in field_text:

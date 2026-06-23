@@ -12,6 +12,8 @@ logger = logging.getLogger(__name__)
 # Set in .env:
 #   EMBEDDING_PROVIDER=ollama   → uses Mac Mini nomic-embed-text
 #   EMBEDDING_PROVIDER=openai   → uses text-embedding-3-small (default)
+from dotenv import load_dotenv
+load_dotenv()
 EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "openai").lower()
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://192.168.1.102:11434")
@@ -94,6 +96,71 @@ def cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
     return float(np.dot(a, b) / norm)
 
 
+
+
+# ── Chinese exact-match lookup ─────────────────────────────────
+def _load_zh_index() -> dict:
+    """
+    Build a lookup index: zh_tw → list of cache entries.
+    Used to bypass broken vector search for Chinese queries.
+    nomic-embed-text on ARM64 produces near-identical embeddings
+    for all Chinese financial terms, making cosine similarity
+    unreliable for Chinese text.
+    """
+    cache = _load_embeddings_cache()
+    index = {}
+    for concept_id, entry in cache.items():
+        zh = entry.get("zh_tw")
+        if zh:
+            if zh not in index:
+                index[zh] = []
+            index[zh].append({
+                "concept_name": concept_id,
+                "zh_tw": zh,
+                "en": entry.get("en"),
+                "code": entry.get("code"),
+                "statement_type": entry.get("statement_type"),
+                "score": 99.0,
+                "mapped_from": zh,
+                "mapping_queries": [],
+                "mapping_aliases": [],
+                "is_high_confidence": True,
+                "is_ambiguous": False,
+            })
+    return index
+
+_zh_index: dict = {}
+_zh_index_loaded: bool = False
+
+def _get_zh_index() -> dict:
+    global _zh_index, _zh_index_loaded
+    if not _zh_index_loaded:
+        _zh_index = _load_zh_index()
+        _zh_index_loaded = True
+    return _zh_index
+
+def is_chinese(text: str) -> bool:
+    return any("\u4e00" <= ch <= "\u9fff" for ch in text)
+
+def zh_exact_lookup(
+    field_name: str,
+    statement_type: str,
+    limit: int = 8,
+) -> list:
+    """
+    Direct lookup by Chinese label.
+    Returns matches filtered by statement_type if available.
+    """
+    index = _get_zh_index()
+    matches = index.get(field_name.strip(), [])
+    if not matches:
+        return []
+    if statement_type:
+        filtered = [m for m in matches if not m["statement_type"] or m["statement_type"] == statement_type]
+        if filtered:
+            matches = filtered
+    return matches[:limit]
+
 # ── Load embeddings cache ──────────────────────────────────────
 
 def _load_embeddings_cache() -> Dict:
@@ -173,6 +240,19 @@ def vector_find_candidates(
     Returns empty list if cache not built — caller should fall back
     to keyword matching (find_candidates).
     """
+    # ── Chinese exact-match bypass ────────────────────────────
+    # nomic-embed-text on ARM64 produces unreliable embeddings for
+    # Chinese text — all terms cluster at ~97+ cosine similarity.
+    # Use direct dictionary lookup for Chinese queries instead.
+    if is_chinese(field_name):
+        results = zh_exact_lookup(field_name, statement_type, limit)
+        if results:
+            logger.info(
+                "[vector_candidate_search] zh_exact_lookup hit for '%s' → %d results",
+                field_name, len(results),
+            )
+            return results
+
     cache = _load_embeddings_cache()
     if not cache:
         logger.warning(

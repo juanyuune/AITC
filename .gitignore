@@ -201,3 +201,19 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Virtual environments (project-specific)
+agent-env/
+mcp-venv/
+
+# XBRL database (large binary, not versioned)
+*.db
+
+# Node modules
+node_modules/
+
+# Claude Code
+.claude/
+
+# ZIP files
+*.zip

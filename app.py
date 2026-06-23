@@ -38,7 +38,10 @@ app.include_router(api_router)
 origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "http://192.168.20.169:3001",
+    "http://192.168.20.169:3000",   # ← add this
 ]
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,

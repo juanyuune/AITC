@@ -2771,8 +2771,8 @@
       "http://www.xbrl.org/tifrs/fr/role/BalanceSheet",
       "http://www.xbrl.org/tifrs/fr/role/StatementOfCashFlows"
     ],
-    "zh_tw": null,
-    "en": null,
+    "zh_tw": "現金及約當現金",
+    "en": "Cash and cash equivalents",
     "code": "1100",
     "labels": {
       "http://www.xbrl.org/2003/role/periodEndLabel": {

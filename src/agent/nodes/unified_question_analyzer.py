@@ -96,47 +96,127 @@ def unified_question_analyzer(state: OverallState) -> OverallState:
     started_at = perf_counter()
     question = state.get("user_input", "").strip()
 
-    structured_llm = chat_model.with_structured_output(UnifiedAnalysis)
+    from langchain_core.output_parsers import JsonOutputParser
+    from langchain_core.prompts import PromptTemplate
+    from langchain_core.runnables import RunnableLambda
+    import re as _re
 
-    prompt = f"""你是台灣信用徵信 AI 系統的財務報表分析器。
+    parser = JsonOutputParser(pydantic_object=UnifiedAnalysis)
 
-請分析以下使用者問題，一次性回傳完整結構化分析。
+    def extract_and_normalize(message):
+        text = message.content if hasattr(message, "content") else str(message)
+        text = _re.sub(r"```[a-z]*\s*", "", text)
+        text = _re.sub(r"```\s*", "", text)
+        text = text.strip()
+        start = text.find("{")
+        if start != -1:
+            depth = 0
+            for i, ch in enumerate(text[start:], start):
+                if ch == "{": depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return text[start:i+1]
+        if "question_type" in text or "rephrased" in text:
+            return "{" + text + "}"
+        return text
 
-任務一 — 改寫問題：
-若問題已完整（含公司名稱、年份、季度、欄位），直接原文回傳。
-若問題不完整或依賴前文，改寫為可獨立理解的完整問題。
+    prompt_template = PromptTemplate(
+        template="""你是台灣信用徵信 AI 系統的財務報表分析器。
+只輸出 JSON，不要任何說明文字或 markdown。
 
-任務二 — 分類問題類型：
-EXACT_QUERY  → 詢問特定公司某期間的特定數值或欄位
-              例：請給我台泥 2024年Q1 的現金及約當現金
-SEMANTIC     → 詢問定義、說明或廣泛查詢，不需判斷
-ANALYSIS     → 詢問趨勢分析、風險評估或跨多筆資料的推理
-              例：台泥 2024年的現金水位是否充足？
-DECISION     → 詢問建議、結論或評估
-
-任務三 — 識別所需財務報表：
-balance_sheet                   → 資產、負債、權益、現金及約當現金
-comprehensive_income_statement  → 營收、成本、利潤、費用、毛利率
-statement_of_cash_flows         → 營業/投資/籌資活動現金流
-
-若需要多張報表請全部列出。
+{format_instructions}
 
 使用者問題：{question}
-"""
+
+任務一 — rephrased_question：若問題已完整直接回傳原文，否則改寫為完整問題。
+
+任務二 — question_type：
+EXACT_QUERY → 詢問特定數值或欄位（例：現金及約當現金、應收帳款淨額、營業收入）
+ANALYSIS → 趨勢分析、風險評估、跨期比較
+SEMANTIC → 詢問定義說明
+DECISION → 詢問建議結論
+
+任務三 — statement_types（可多選）：
+balance_sheet → 資產、負債、權益、現金及約當現金、應收帳款、存貨
+comprehensive_income_statement → 營收、成本、利潤、費用、毛利率、EPS
+statement_of_cash_flows → 營業/投資/籌資活動現金流
+
+任務四 — confidence：0.0到1.0的信心分數
+任務五 — primary_statement_type：最重要的一張報表""",
+        input_variables=["question"],
+        partial_variables={"format_instructions": parser.get_format_instructions()},
+    )
+
+    chain = prompt_template | chat_model | RunnableLambda(extract_and_normalize) | parser
+
+    # ── Keyword-based statement type override ─────────────────
+    # Breeze2 is unreliable at classifying statement types.
+    # Use hardcoded rules for common terms — fast and accurate.
+    BALANCE_SHEET_KEYWORDS = [
+        "現金及約當現金", "現金水位", "應收帳款", "應收票據", "存貨", "預付款項",
+        "總資產", "資產總額", "資產總計", "資產合計",
+        "負債總額", "負債總計", "負債合計", "負債及權益總計",
+        "權益總額", "權益總計", "股東權益", "保留盈餘",
+        "流動資產", "流動負債", "流動比率",
+        "非流動資產", "非流動負債",
+        "應付帳款", "應付票據", "短期借款", "長期借款", "長期負債",
+        "不動產廠房及設備", "無形資產", "遞延所得稅",
+        "每股淨值", "淨值",
+    ]
+    INCOME_KEYWORDS = [
+        "營業收入", "營收", "毛利", "毛利率", "營業費用", "營業利益",
+        "稅前淨利", "稅後淨利", "淨利", "每股盈餘", "EPS", "營業成本",
+        "利息收入", "其他收入", "綜合損益",
+    ]
+    CASHFLOW_KEYWORDS = [
+        "營業活動現金流", "投資活動現金流", "籌資活動現金流",
+        "自由現金流", "資本支出", "折舊", "攤銷",
+    ]
+
+    def detect_statement_types(q):
+        found = []
+        if any(kw in q for kw in BALANCE_SHEET_KEYWORDS):
+            found.append("balance_sheet")
+        if any(kw in q for kw in INCOME_KEYWORDS):
+            found.append("comprehensive_income_statement")
+        if any(kw in q for kw in CASHFLOW_KEYWORDS):
+            found.append("statement_of_cash_flows")
+        return found or None
+
+    keyword_types = detect_statement_types(question)
+
+    # If question is clearly analytical, ensure both statement types included
+    ANALYSIS_KEYWORDS = ["是否充足", "是否有風險", "獲利能力", "負債結構", "趨勢",
+                         "是否持續", "分析", "評估", "水位"]
+    if any(kw in question for kw in ANALYSIS_KEYWORDS):
+        if not keyword_types:
+            keyword_types = ["balance_sheet", "comprehensive_income_statement"]
+        elif "balance_sheet" not in keyword_types:
+            keyword_types.append("balance_sheet")
+        elif "comprehensive_income_statement" not in keyword_types:
+            keyword_types.append("comprehensive_income_statement")
 
     try:
-        result = structured_llm.invoke(prompt).model_dump()
+        result = chain.invoke({"question": question})
+        if hasattr(result, "model_dump"):
+            result = result.model_dump()
     except Exception as exc:
-        # Safe fallback — graph continues with conservative defaults
         print(f"[unified_question_analyzer] structured output failed: {exc}")
         print("[unified_question_analyzer] using safe defaults")
         result = {
             "rephrased_question": question,
             "question_type": "EXACT_QUERY",
-            "confidence": 0.0,
+            "confidence": 0.5,
             "statement_types": ["balance_sheet"],
             "primary_statement_type": "balance_sheet",
         }
+
+    # Override statement_types with keyword detection if available
+    if keyword_types:
+        result["statement_types"] = keyword_types
+        result["primary_statement_type"] = keyword_types[0]
+        print(f"[unified_question_analyzer] keyword_override statement_types={keyword_types}")
 
     # Guard against empty rephrased question
     if not result.get("rephrased_question", "").strip():

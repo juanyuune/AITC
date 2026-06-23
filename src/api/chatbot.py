@@ -13,8 +13,8 @@ from src.services.query_cache import get_cached_answer, save_cached_answer
 chatbot_router = APIRouter()
 
 # ── Show correct model name regardless of provider ────────────
-MODEL_NAME = os.getenv("OLLAMA_MODEL") or os.getenv("OPENAI_MODEL_NAME", "unknown")
-PROVIDER = "Ollama (On-Premise)" if os.getenv("OLLAMA_MODEL") else "OpenAI API"
+MODEL_NAME = os.getenv("VLLM_MODEL", os.getenv("OLLAMA_MODEL", "unknown")).split("/")[-1]
+PROVIDER = "vLLM Breeze2 (On-Premise)" if os.getenv("VLLM_MODEL") else "Ollama (On-Premise)"
 
 
 @chatbot_router.get("/chatbot/{user_input}")
@@ -41,6 +41,7 @@ async def get_chatbot_answer(
                 "provider": PROVIDER,
                 "response_time_seconds": elapsed,
                 "cached": True,
+                "dispatch_decision": "private",
             }
     else:
         print(f"[chatbot] bypass_cache=true — running full pipeline")
@@ -59,9 +60,10 @@ async def get_chatbot_answer(
     print(f"📦 Cached   : No (fresh run)")
     print(f"📝 Answer   :")
     print("-" * 60)
-    # Print full answer line by line so it's readable in terminal
     for line in answer.splitlines():
         print(f"   {line}")
+    if not answer.strip():
+        print("   (empty answer)")
     print("=" * 60)
 
     # Save to cache only if not bypassing
@@ -74,4 +76,5 @@ async def get_chatbot_answer(
         "provider": PROVIDER,
         "response_time_seconds": elapsed,
         "cached": False,
+        "dispatch_decision": graph_answer.get("dispatch_decision", "private"),
     }

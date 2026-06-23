@@ -1,0 +1,13 @@
+{
+  "name": "aitc-plugins",
+  "owner": {
+    "name": "AITC AI Development Team"
+  },
+  "plugins": [
+    {
+      "name": "aitc-credit-investigation",
+      "description": "AITC 台灣信用調查 AI 助手",
+      "path": "./aitc-credit-investigation"
+    }
+  ]
+}
