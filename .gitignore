@@ -1,21 +1,30 @@
-# Large data files — do not commit
+# Large data files
 xbrl_downloads/
 output/
 logs/
 
-# Database — too large
+# Database
 *.db
 
 # Log files
 *.log
 nohup.out
 
-# Python cache
+# Python
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
 .env
 
-# Embeddings cache — large JSON
+# Virtual environments
+agent-env/
+mcp-venv/
+
+# Large cache files
 src/services/xbrl_embeddings_cache_ollama.json
 src/services/query_result_cache.json
+
+# OS
+.DS_Store
+Thumbs.db
