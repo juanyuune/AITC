@@ -1,0 +1,144 @@
+AITC Expansion — Setup & Usage Guide
+======================================
+How to add companies and automate updates.
+Date: June 2026
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 1 — Copy scripts to your DGX
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Copy these 4 files to ~/AITC/scripts/ on the DGX:
+
+    01_fsc_downloader.py      Downloads XBRL files from FSC
+    02_xbrl_importer.py       Parses and loads into database
+    03_auto_update.py         Ties both together (used by cron)
+    add_company.py            The simple way to add one company
+    company_list.txt          Edit this list as needed
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 2 — Install dependencies
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    cd ~/AITC
+    source ~/mcp-venv/bin/activate
+    pip install requests --break-system-packages
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 3 — Set environment variable
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Add this to ~/.bashrc so all scripts know where the database is:
+
+    echo 'export XBRL_DB_PATH=/home/user/AITC/FinancialStatementXBRL.db' >> ~/.bashrc
+    echo 'export XBRL_DOWNLOAD_DIR=/home/user/AITC/xbrl_downloads' >> ~/.bashrc
+    source ~/.bashrc
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HOW TO ADD A COMPANY (the simple way)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    cd ~/AITC/scripts
+    source ~/mcp-venv/bin/activate
+
+    # Add one company (e.g. TSMC)
+    python add_company.py 2330
+
+    # Add several at once
+    python add_company.py 2330 2881 2882 2412
+
+    # Add from the prepared list
+    python add_company.py --file company_list.txt
+
+After it finishes, open Claude Code and test:
+
+    cd ~/AITC/plugins/aitc-credit-investigation
+    claude
+    ❯ xbrl 2330 最新 營業收入
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HOW TO ADD ALL LISTED COMPANIES (one-time expansion)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+This downloads from FSC — takes several hours for all ~1,700 companies.
+Run it overnight or over a weekend.
+
+    nohup python 03_auto_update.py --all > logs/expansion.log 2>&1 &
+
+    # Check progress anytime:
+    tail -f logs/expansion.log
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HOW TO SET UP AUTO-UPDATE (cron)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+This makes the database update itself every day at 6:00 AM.
+
+    crontab -e
+
+Add this line:
+
+    0 6 * * * /home/user/mcp-venv/bin/python /home/user/AITC/scripts/03_auto_update.py >> /home/user/AITC/logs/auto_update.log 2>&1
+
+Save and exit. To verify it was added:
+
+    crontab -l
+
+The cron job will:
+  - Check for new XBRL filings for all companies already in the DB
+  - Download only the ones that are new (incremental)
+  - Import them into the database
+  - Skip anything already imported
+
+New data from FSC appears on these dates each year:
+  - Mid-May     (Q1 results)
+  - Mid-August  (Q2 results)
+  - Mid-November (Q3 results)
+  - End of March (Q4 / full-year results)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CHECKING DATABASE STATUS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    sqlite3 ~/AITC/FinancialStatementXBRL.db
+
+    -- How many companies?
+    SELECT COUNT(DISTINCT stock_code) FROM report_instance;
+
+    -- Which companies and how many periods each?
+    SELECT stock_code, COUNT(DISTINCT year||quarter) as periods
+    FROM   report_instance
+    GROUP  BY stock_code
+    ORDER  BY stock_code;
+
+    -- How many total rows?
+    SELECT COUNT(*) FROM financial_metric_value;
+
+    -- Latest import date?
+    SELECT MAX(imported_at) FROM report_instance;
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RECOMMENDED EXPANSION PLAN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Week 1 — Quick wins (companies most requested):
+  python add_company.py 2330 2881 2882 2883 2884 2886 2891 2892
+
+Week 2 — Banking sector complete:
+  python add_company.py --file company_list.txt (banking section only)
+
+Week 3 — Tech & semiconductor:
+  python add_company.py 2317 2454 3034 4938 2382
+
+Month 2 — Full expansion overnight run:
+  nohup python 03_auto_update.py --all > logs/full_expansion.log 2>&1 &
+
+After full expansion:
+  Set up the cron job — system updates itself forever.
