@@ -28,3 +28,9 @@ src/services/query_result_cache.json
 # OS
 .DS_Store
 Thumbs.db
+FinancialStatementXBRL.db.before_dedup_*
+*.bak.*
+.last_import_marker
+FinancialStatementXBRL.db.before_dedup_*
+*.bak.*
+.last_import_marker
