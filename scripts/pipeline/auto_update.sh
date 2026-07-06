@@ -18,7 +18,7 @@
 
 # ── configuration ─────────────────────────────────────────────────────────────
 AITC_DIR="/home/user/AITC"
-SCRIPTS_DIR="$AITC_DIR/scripts"
+SCRIPTS_DIR="$AITC_DIR/scripts/pipeline"
 LOG_DIR="$AITC_DIR/logs"
 LOG="$LOG_DIR/auto_update.log"
 SUMMARY_FILE="$LOG_DIR/last_run_summary.txt"
