@@ -154,7 +154,7 @@ log "Step 4: Rebuild search index"
 if [ "$COMPANIES_IMPORTED" -gt 0 ]; then
     source "$AGENT_VENV/bin/activate"
     export XBRL_DB_PATH="$DB_PATH"
-    python "$SCRIPTS_DIR/build_xbrl_embeddings.py" >> "$LOG" 2>&1
+    cd /home/user/AITC-CreditInvestigationChatBotAgent && SQLITE_DB_PATH="$DB_PATH" $AGENT_VENV/bin/python3 build_xbrl_embeddings.py >> "$LOG" 2>&1
     EMBED_EXIT=$?
     deactivate
 
