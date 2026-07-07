@@ -451,6 +451,282 @@ def run_read_query(sql: str) -> str:
         return f"SQL錯誤：{e}"
 
 
+
+@mcp.tool()
+def get_credit_summary(company_code: str, period: str) -> str:
+    """
+    Get a complete credit investigation summary for one company in one call.
+    Returns all key metrics: assets, liabilities, equity, net income, debt ratio,
+    EPS, and cash — everything needed for a credit assessment.
+    Args:
+        company_code: Taiwan stock code, e.g. "2881"
+        period:       e.g. "2024Q3" or "2024"
+    """
+    try:
+        year, quarter = parse_period(period)
+        q = quarter if quarter else "Q4"
+        with get_db() as conn:
+            # Key concepts for credit assessment
+            concepts = {
+                "總資產":        ["ifrs-full_Assets", "ifrs-full_EquityAndLiabilities"],
+                "總負債":        ["ifrs-full_Liabilities"],
+                "股東權益":      ["ifrs-full_EquityAttributableToOwnersOfParent", "ifrs-full_Equity"],
+                "本期淨利":      ["ifrs-full_ProfitLossFromContinuingOperations", "ifrs-full_ProfitLoss"],
+                "稅前淨利":      ["ifrs-full_ProfitLossBeforeTax"],
+                "每股盈餘":      ["ifrs-full_BasicEarningsLossPerShare"],
+                "現金及約當現金": ["ifrs-full_CashAndCashEquivalents"],
+                "營業活動現金流": ["ifrs-full_CashFlowsFromUsedInOperatingActivities",
+                                   "tifrs-SCF_CashFlowsFromUsedInOperatingActivities"],
+            }
+            results = {}
+            for label, concept_list in concepts.items():
+                for concept in concept_list:
+                    row = conn.execute("""
+                        SELECT fmv.value, xf.decimals, xf.unit_id, ri.period_end
+                        FROM financial_metric_value fmv
+                        JOIN report_instance ri ON ri.report_id = fmv.report_id
+                        LEFT JOIN xbrl_fact xf ON xf.fact_id = fmv.fact_id
+                        WHERE ri.company_code = ? AND ri.year = ? AND ri.quarter = ?
+                        AND fmv.concept_id = ? AND fmv.value IS NOT NULL
+                        AND (xf.instant_date = ri.period_end
+                             OR xf.period_end = ri.period_end)
+                        ORDER BY CASE WHEN xf.segment_json IS NULL THEN 0 ELSE 1 END,
+                                 ABS(fmv.value) DESC LIMIT 1
+                    """, (company_code, year, q or "Q4", concept)).fetchone()
+                    if row:
+                        raw, dec, unit, period_end = row
+                        # Apply decimals scaling
+                        if dec == -3:
+                            val = raw / 1000
+                            unit_label = "千元新台幣"
+                        elif dec == -6:
+                            val = raw / 1000000
+                            unit_label = "百萬元新台幣"
+                        else:
+                            val = raw
+                            # Clean up unit labels
+                            if unit in ("EarningsPerShare", "shares", "Share"):
+                                unit_label = "元"
+                            else:
+                                unit_label = "元" if unit in ("TWD", None, "") else unit
+                        # Format value — strip trailing zeros for decimals
+                        if val == int(val):
+                            val_fmt = f"{val:,.0f}"
+                        else:
+                            # Remove trailing zeros (e.g. 8.6100 → 8.61)
+                            val_fmt = f"{val:,.4f}".rstrip("0").rstrip(".")
+
+                        # Add 億元 reference for large amounts in 千元
+                        yi_ref = ""
+                        if unit_label == "千元新台幣" and val >= 10000000:
+                            yi = round(val / 100000)
+                            yi_ref = f"（約 {yi:,} 億元）"
+
+                        # Fix EPS unit
+                        if label == "每股盈餘":
+                            unit_label = "元／股"
+
+                        results[label] = {
+                            "value": round(val, 4),
+                            "value_formatted": f"{val_fmt} {unit_label}{yi_ref}".strip(),
+                            "unit": unit_label,
+                            "period_end": period_end,
+                        }
+                        break  # found, stop trying alternatives
+
+            # Compute debt ratio if both assets and liabilities available
+            if "總資產" in results and "總負債" in results:
+                assets = results["總資產"]["value"]
+                liab   = results["總負債"]["value"]
+                if assets > 0:
+                    debt_ratio = round(liab / assets * 100, 2)
+                    results["負債比率"] = {
+                        "value": debt_ratio,
+                        "value_formatted": f"{debt_ratio}%",
+                        "unit": "",
+                        "formula": "總負債 ÷ 總資產 × 100",
+                    }
+
+            # Get company name
+            name_row = conn.execute("""
+                SELECT ri.company_code FROM report_instance ri
+                WHERE ri.company_code = ? LIMIT 1
+            """, (company_code,)).fetchone()
+
+            return json.dumps({
+                "company_code": company_code,
+                "period": fmt_period(year, quarter),
+                "metrics": results,
+                "caveat": q4_caveat([q] if q else ["Q4"]),
+                "disclaimer": "本資料僅供參考，財務決策請以公司正式公告及專業人員審查為準。",
+            }, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return f"錯誤：{e}"
+
+
+@mcp.tool()
+def get_risk_indicators(company_code: str, periods: list) -> str:
+    """
+    Compute credit risk indicators across multiple periods for trend analysis.
+    Returns debt ratio, asset growth, net income trend, and cash flow coverage.
+    Designed to give Claude everything needed for a credit risk assessment.
+    Args:
+        company_code: Taiwan stock code, e.g. "2881"
+        periods:      List of periods e.g. ["2022Q4","2023Q4","2024Q3"]
+    """
+    try:
+        period_data = {}
+        with get_db() as conn:
+            for period in periods:
+                year, quarter = parse_period(period)
+                q = quarter if quarter else "Q4"
+
+                def fetch(concepts):
+                    for concept in concepts:
+                        row = conn.execute("""
+                            SELECT fmv.value, xf.decimals
+                            FROM financial_metric_value fmv
+                            JOIN report_instance ri ON ri.report_id = fmv.report_id
+                            LEFT JOIN xbrl_fact xf ON xf.fact_id = fmv.fact_id
+                            WHERE ri.company_code = ? AND ri.year = ? AND ri.quarter = ?
+                            AND fmv.concept_id = ? AND fmv.value IS NOT NULL
+                            AND (xf.instant_date = ri.period_end
+                                 OR xf.period_end = ri.period_end)
+                            ORDER BY CASE WHEN xf.segment_json IS NULL THEN 0 ELSE 1 END,
+                                     ABS(fmv.value) DESC LIMIT 1
+                        """, (company_code, year, q, concept)).fetchone()
+                        if row:
+                            raw, dec = row
+                            return raw / 1000 if dec == -3 else (raw / 1000000 if dec == -6 else raw)
+                    return None
+
+                assets  = fetch(["ifrs-full_Assets", "ifrs-full_EquityAndLiabilities"])
+                liab    = fetch(["ifrs-full_Liabilities"])
+                equity  = fetch(["ifrs-full_EquityAttributableToOwnersOfParent", "ifrs-full_Equity"])
+                income  = fetch(["ifrs-full_ProfitLossFromContinuingOperations", "ifrs-full_ProfitLoss"])
+                cfo     = fetch(["ifrs-full_CashFlowsFromUsedInOperatingActivities",
+                                  "tifrs-SCF_CashFlowsFromUsedInOperatingActivities"])
+
+                entry = {"unit": "千元新台幣"}
+                if assets:  entry["總資產"] = round(assets, 0)
+                if liab:    entry["總負債"] = round(liab, 0)
+                if equity:  entry["股東權益"] = round(equity, 0)
+                if income:  entry["本期淨利"] = round(income, 0)
+                if cfo:     entry["營業現金流"] = round(cfo, 0)
+                if assets and liab and assets > 0:
+                    entry["負債比率"] = f"{round(liab/assets*100, 2)}%"
+                if assets and equity and assets > 0:
+                    entry["權益比率"] = f"{round(equity/assets*100, 2)}%"
+
+                period_data[period] = entry
+
+        # Compute year-over-year asset growth
+        period_keys = list(period_data.keys())
+        growth = {}
+        for i in range(1, len(period_keys)):
+            prev_p = period_keys[i-1]
+            curr_p = period_keys[i]
+            prev_a = period_data[prev_p].get("總資產")
+            curr_a = period_data[curr_p].get("總資產")
+            if prev_a and curr_a and prev_a > 0:
+                g = round((curr_a - prev_a) / prev_a * 100, 2)
+                growth[f"{prev_p}→{curr_p}"] = f"{g:+.2f}%"
+
+        return json.dumps({
+            "company_code": company_code,
+            "periods_analysed": periods,
+            "data": period_data,
+            "asset_growth": growth,
+            "note": "負債比率 = 總負債÷總資產×100。數值單位：千元新台幣。",
+            "disclaimer": "本資料僅供參考，財務決策請以公司正式公告及專業人員審查為準。",
+        }, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return f"錯誤：{e}"
+
+
+@mcp.tool()
+def generate_credit_report_prompt(
+    company_code: str,
+    company_name: str,
+    period: str,
+    report_type: str = "standard"
+) -> str:
+    """
+    Generate a structured prompt template for Claude to write a Taiwan FSC-style
+    credit investigation report. Call get_credit_summary and get_risk_indicators
+    first to gather the data, then use this prompt to guide report generation.
+    Args:
+        company_code:  Taiwan stock code, e.g. "2881"
+        company_name:  Full company name in Chinese, e.g. "富邦金融控股股份有限公司"
+        period:        Reporting period, e.g. "2024Q3"
+        report_type:   "standard" (default) or "detailed"
+    """
+    sections = {
+        "standard": [
+            "一、公司基本資料（公司名稱、股票代號、產業別、申報期間）",
+            "二、財務結構分析（資產規模、負債比率、股東權益、資本結構說明）",
+            "三、獲利能力分析（本期淨利、每股盈餘、獲利趨勢說明）",
+            "四、流動性與現金流分析（現金及約當現金、營業活動現金流）",
+            "五、信用風險評估（主要風險因子、財務健康度綜合判斷）",
+            "六、結論與建議（整體信用評估摘要、注意事項）",
+        ],
+        "detailed": [
+            "一、公司基本資料與產業背景",
+            "二、財務結構深度分析（近三年趨勢）",
+            "三、獲利能力與成長性分析",
+            "四、流動性風險與現金流量分析",
+            "五、資本適足性評估（適用於銀行與金控）",
+            "六、跨公司比較分析（與同業平均比較）",
+            "七、重大風險因子識別",
+            "八、信用評等建議與授信參考",
+            "九、免責聲明與資料來源",
+        ],
+    }
+
+    chosen = sections.get(report_type, sections["standard"])
+    sections_text = "\n".join(chosen)
+
+    prompt = f"""你是一位台灣金融業資深信用徵審專員。
+請根據以下財務資料，撰寫一份專業的信用調查報告。
+
+【受查公司】
+公司名稱：{company_name}
+股票代號：{company_code}
+申報期間：{period}
+資料來源：台灣金管會MOPS XBRL財務報告（官方申報數據）
+
+【報告格式】
+請依照以下章節結構撰寫，使用繁體中文，語氣專業正式：
+
+{sections_text}
+
+【格式要求】
+- 金額統一使用千元新台幣（NTD thousands）
+- 億元換算公式：千元數值 ÷ 100,000 = 億元
+- 比率保留兩位小數
+- 每個章節需有具體數據支撐，不得僅作一般性描述
+- 結尾必須包含免責聲明：本報告依據公開申報財務資料編製，僅供參考，
+  不構成投資或授信建議，實際決策請以最新公告及專業人員審查為準
+
+【財務數據】
+請將從 get_credit_summary 和 get_risk_indicators 工具取得的數據
+填入各章節分析中。"""
+
+    return json.dumps({
+        "company_code": company_code,
+        "company_name": company_name,
+        "period": period,
+        "report_type": report_type,
+        "prompt_template": prompt,
+        "instructions": [
+            "Step 1: Call get_credit_summary(company_code, period) to get current metrics",
+            "Step 2: Call get_risk_indicators(company_code, ['2022Q4','2023Q4','2024Q3']) for trends",
+            "Step 3: Use this prompt template with the data from steps 1 and 2",
+            "Step 4: Generate the report in Traditional Chinese following the section structure",
+        ],
+        "disclaimer": "本工具產生之報告架構僅供參考，正式信用徵審報告需經專業人員審核。",
+    }, ensure_ascii=False, indent=2)
+
 if __name__ == "__main__":
     db_path = os.path.expanduser(DB_PATH)
     logger.info(f"XBRL DB path : {db_path}")
