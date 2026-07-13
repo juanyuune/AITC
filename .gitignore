@@ -34,3 +34,6 @@ FinancialStatementXBRL.db.before_dedup_*
 FinancialStatementXBRL.db.before_dedup_*
 *.bak.*
 .last_import_marker
+scripts/src/services/xbrl_embeddings_cache_ollama.json
+scripts/src/services/xbrl_embeddings_cache*.json
+.aitc_pids
