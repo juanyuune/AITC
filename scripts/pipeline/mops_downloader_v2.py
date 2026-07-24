@@ -134,6 +134,6 @@ if __name__ == "__main__":
     print(f"\nCompanies: {len(codes)}  |  Source: mopsov.twse.com.tw\n")
     total = 0
     for code in codes:
-        files = download_company(code, year_filter=args.year, quarter_filter=args.quarter)
+        files = download_company(code, year_filter=int(args.year) if args.year else None, quarter_filter=args.quarter)
         total += len(files)
     print(f"\nDone. {total} filing(s) downloaded.")

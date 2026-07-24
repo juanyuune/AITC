@@ -59,6 +59,40 @@ def rows_to_list(rows) -> list:
     return [dict(row) for row in rows]
 
 
+# Stock code → Chinese company name mapping (Taiwan FSC institutions)
+_COMPANY_NAMES = {
+    "2801": "彰化商業銀行股份有限公司",
+    "2809": "京城商業銀行股份有限公司",
+    "2812": "台中商業銀行股份有限公司",
+    "2834": "臺灣企銀股份有限公司",
+    "2838": "聯邦商業銀行股份有限公司",
+    "2845": "遠東國際商業銀行股份有限公司",
+    "2850": "新光人壽保險股份有限公司",
+    "2851": "寶瑞人壽保險股份有限公司",
+    "2852": "第一金人壽保險股份有限公司",
+    "2867": "三商美邦人壽保險股份有限公司",
+    "2880": "華南金融控股股份有限公司",
+    "2881": "富邦金融控股股份有限公司",
+    "2882": "國泰金融控股股份有限公司",
+    "2883": "開發金融控股股份有限公司",
+    "2884": "玉山金融控股股份有限公司",
+    "2885": "元大金融控股股份有限公司",
+    "2886": "兆豐金融控股股份有限公司",
+    "2887": "台新金融控股股份有限公司",
+    "2888": "新光金融控股股份有限公司",
+    "2889": "國票金融控股股份有限公司",
+    "2890": "永豐金融控股股份有限公司",
+    "2891": "中國信託金融控股股份有限公司",
+    "2892": "第一金融控股股份有限公司",
+    "2905": "三商金融控股股份有限公司",
+    "5834": "保誠人壽保險股份有限公司",
+    "5876": "上海商業儲蓄銀行股份有限公司",
+}
+
+def get_company_name(company_code: str) -> str:
+    return _COMPANY_NAMES.get(company_code, f"股票代號{company_code}")
+
+
 def parse_period(period: str) -> tuple:
     """
     Parse period string into (year, quarter_str).
@@ -467,6 +501,10 @@ def get_credit_summary(company_code: str, period: str) -> str:
         q = quarter if quarter else "Q4"
         with get_db() as conn:
             # Key concepts for credit assessment
+            # Concept priority order matters:
+            # - Balance sheet items: use instant_date filter
+            # - Income/CF items: prefer YTD (period_start=year-01-01) over single quarter
+            # - 本期淨利: ProfitLossFromContinuingOperations (net income) before ProfitLoss (comprehensive)
             concepts = {
                 "總資產":        ["ifrs-full_Assets", "ifrs-full_EquityAndLiabilities"],
                 "總負債":        ["ifrs-full_Liabilities"],
@@ -478,21 +516,42 @@ def get_credit_summary(company_code: str, period: str) -> str:
                 "營業活動現金流": ["ifrs-full_CashFlowsFromUsedInOperatingActivities",
                                    "tifrs-SCF_CashFlowsFromUsedInOperatingActivities"],
             }
+            # Period filters: balance sheet = instant, income/CF = YTD period_start
+            _INSTANT_FIELDS = {"總資產", "總負債", "股東權益", "現金及約當現金"}
+            _YTD_FIELDS = {"本期淨利", "稅前淨利", "每股盈餘", "營業活動現金流"}
+            ytd_start = f"{year}-01-01"
+            ytd_end   = f"{year}-{_Q_WINDOWS.get(q or 'Q4', ('01-01','12-31'))[1]}"
             results = {}
             for label, concept_list in concepts.items():
+                is_instant = label in _INSTANT_FIELDS
+                is_ytd     = label in _YTD_FIELDS
                 for concept in concept_list:
-                    row = conn.execute("""
-                        SELECT fmv.value, xf.decimals, xf.unit_id, ri.period_end
-                        FROM financial_metric_value fmv
-                        JOIN report_instance ri ON ri.report_id = fmv.report_id
-                        LEFT JOIN xbrl_fact xf ON xf.fact_id = fmv.fact_id
-                        WHERE ri.company_code = ? AND ri.year = ? AND ri.quarter = ?
-                        AND fmv.concept_id = ? AND fmv.value IS NOT NULL
-                        AND (xf.instant_date = ri.period_end
-                             OR xf.period_end = ri.period_end)
-                        ORDER BY CASE WHEN xf.segment_json IS NULL THEN 0 ELSE 1 END,
-                                 ABS(fmv.value) DESC LIMIT 1
-                    """, (company_code, year, q or "Q4", concept)).fetchone()
+                    if is_instant:
+                        # Balance sheet: match instant_date = period_end
+                        row = conn.execute("""
+                            SELECT fmv.value, xf.decimals, xf.unit_id, ri.period_end
+                            FROM financial_metric_value fmv
+                            JOIN report_instance ri ON ri.report_id = fmv.report_id
+                            LEFT JOIN xbrl_fact xf ON xf.fact_id = fmv.fact_id
+                            WHERE ri.company_code = ? AND ri.year = ? AND ri.quarter = ?
+                            AND fmv.concept_id = ? AND fmv.value IS NOT NULL
+                            AND xf.instant_date = ri.period_end
+                            AND xf.segment_json IS NULL
+                            ORDER BY ABS(fmv.value) DESC LIMIT 1
+                        """, (company_code, year, q or "Q4", concept)).fetchone()
+                    else:
+                        # Income/CF: match YTD period (period_start=year-01-01)
+                        row = conn.execute("""
+                            SELECT fmv.value, xf.decimals, xf.unit_id, ri.period_end
+                            FROM financial_metric_value fmv
+                            JOIN report_instance ri ON ri.report_id = fmv.report_id
+                            LEFT JOIN xbrl_fact xf ON xf.fact_id = fmv.fact_id
+                            WHERE ri.company_code = ? AND ri.year = ? AND ri.quarter = ?
+                            AND fmv.concept_id = ? AND fmv.value IS NOT NULL
+                            AND xf.period_start = ? AND xf.period_end = ?
+                            AND xf.segment_json IS NULL
+                            ORDER BY ABS(fmv.value) DESC LIMIT 1
+                        """, (company_code, year, q or "Q4", concept, ytd_start, ytd_end)).fetchone()
                     if row:
                         raw, dec, unit, period_end = row
                         # Apply decimals scaling
@@ -553,9 +612,19 @@ def get_credit_summary(company_code: str, period: str) -> str:
                 WHERE ri.company_code = ? LIMIT 1
             """, (company_code,)).fetchone()
 
+            # Get industry type for this company
+            industry_row = conn.execute(
+                "SELECT industry_type FROM report_instance WHERE company_code=? AND year=? AND quarter=? LIMIT 1",
+                (company_code, year, q or "Q4")
+            ).fetchone()
+            industry_type = industry_row[0] if industry_row else "FH"
+
             return json.dumps({
                 "company_code": company_code,
+                "company_name": get_company_name(company_code),
+                "industry_type": industry_type,
                 "period": fmt_period(year, quarter),
+                "period_note": "損益表與現金流量表數值為年初至本期末之累計數（YTD）；資產負債表數值為期末時間點數。",
                 "metrics": results,
                 "caveat": q4_caveat([q] if q else ["Q4"]),
                 "disclaimer": "本資料僅供參考，財務決策請以公司正式公告及專業人員審查為準。",
@@ -581,7 +650,14 @@ def get_risk_indicators(company_code: str, periods: list) -> str:
                 year, quarter = parse_period(period)
                 q = quarter if quarter else "Q4"
 
-                def fetch(concepts):
+                # Period bounds for this specific period
+                _ytd_start = f"{year}-01-01"
+                _q_end     = _Q_WINDOWS.get(q, ("01-01", "12-31"))[1]
+                _ytd_end   = f"{year}-{_q_end}"
+                _instant   = _ytd_end  # balance sheet snapshot date
+
+                def fetch_instant(concepts):
+                    """Balance sheet items — instant date snapshot."""
                     for concept in concepts:
                         row = conn.execute("""
                             SELECT fmv.value, xf.decimals
@@ -590,22 +666,40 @@ def get_risk_indicators(company_code: str, periods: list) -> str:
                             LEFT JOIN xbrl_fact xf ON xf.fact_id = fmv.fact_id
                             WHERE ri.company_code = ? AND ri.year = ? AND ri.quarter = ?
                             AND fmv.concept_id = ? AND fmv.value IS NOT NULL
-                            AND (xf.instant_date = ri.period_end
-                                 OR xf.period_end = ri.period_end)
-                            ORDER BY CASE WHEN xf.segment_json IS NULL THEN 0 ELSE 1 END,
-                                     ABS(fmv.value) DESC LIMIT 1
-                        """, (company_code, year, q, concept)).fetchone()
+                            AND xf.instant_date = ?
+                            AND xf.segment_json IS NULL
+                            ORDER BY ABS(fmv.value) DESC LIMIT 1
+                        """, (company_code, year, q, concept, _instant)).fetchone()
                         if row:
                             raw, dec = row
                             return raw / 1000 if dec == -3 else (raw / 1000000 if dec == -6 else raw)
                     return None
 
-                assets  = fetch(["ifrs-full_Assets", "ifrs-full_EquityAndLiabilities"])
-                liab    = fetch(["ifrs-full_Liabilities"])
-                equity  = fetch(["ifrs-full_EquityAttributableToOwnersOfParent", "ifrs-full_Equity"])
-                income  = fetch(["ifrs-full_ProfitLossFromContinuingOperations", "ifrs-full_ProfitLoss"])
-                cfo     = fetch(["ifrs-full_CashFlowsFromUsedInOperatingActivities",
-                                  "tifrs-SCF_CashFlowsFromUsedInOperatingActivities"])
+                def fetch_ytd(concepts):
+                    """Income/CF items — YTD cumulative (period_start=year-01-01)."""
+                    for concept in concepts:
+                        row = conn.execute("""
+                            SELECT fmv.value, xf.decimals
+                            FROM financial_metric_value fmv
+                            JOIN report_instance ri ON ri.report_id = fmv.report_id
+                            LEFT JOIN xbrl_fact xf ON xf.fact_id = fmv.fact_id
+                            WHERE ri.company_code = ? AND ri.year = ? AND ri.quarter = ?
+                            AND fmv.concept_id = ? AND fmv.value IS NOT NULL
+                            AND xf.period_start = ? AND xf.period_end = ?
+                            AND xf.segment_json IS NULL
+                            ORDER BY ABS(fmv.value) DESC LIMIT 1
+                        """, (company_code, year, q, concept, _ytd_start, _ytd_end)).fetchone()
+                        if row:
+                            raw, dec = row
+                            return raw / 1000 if dec == -3 else (raw / 1000000 if dec == -6 else raw)
+                    return None
+
+                assets  = fetch_instant(["ifrs-full_Assets", "ifrs-full_EquityAndLiabilities"])
+                liab    = fetch_instant(["ifrs-full_Liabilities"])
+                equity  = fetch_instant(["ifrs-full_EquityAttributableToOwnersOfParent", "ifrs-full_Equity"])
+                income  = fetch_ytd(["ifrs-full_ProfitLossFromContinuingOperations", "ifrs-full_ProfitLoss"])
+                cfo     = fetch_ytd(["ifrs-full_CashFlowsFromUsedInOperatingActivities",
+                                     "tifrs-SCF_CashFlowsFromUsedInOperatingActivities"])
 
                 entry = {"unit": "千元新台幣"}
                 if assets:  entry["總資產"] = round(assets, 0)
@@ -634,10 +728,11 @@ def get_risk_indicators(company_code: str, periods: list) -> str:
 
         return json.dumps({
             "company_code": company_code,
+            "company_name": get_company_name(company_code),
             "periods_analysed": periods,
             "data": period_data,
             "asset_growth": growth,
-            "note": "負債比率 = 總負債÷總資產×100。數值單位：千元新台幣。",
+            "note": "負債比率=總負債÷總資產×100。本期淨利與現金流為YTD累計數；資產負債表為期末快照。單位：千元新台幣。",
             "disclaimer": "本資料僅供參考，財務決策請以公司正式公告及專業人員審查為準。",
         }, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -663,12 +758,12 @@ def generate_credit_report_prompt(
     """
     sections = {
         "standard": [
-            "一、公司基本資料（公司名稱、股票代號、產業別、申報期間）",
-            "二、財務結構分析（資產規模、負債比率、股東權益、資本結構說明）",
-            "三、獲利能力分析（本期淨利、每股盈餘、獲利趨勢說明）",
-            "四、流動性與現金流分析（現金及約當現金、營業活動現金流）",
-            "五、信用風險評估（主要風險因子、財務健康度綜合判斷）",
-            "六、結論與建議（整體信用評估摘要、注意事項）",
+            "一、公司基本資料（公司名稱、股票代號、產業別、申報期間、報告編製日期）",
+            "二、財務結構分析（資產規模、負債比率含FSC判定、股東權益、近三期同季趨勢）",
+            "三、獲利能力分析（本期淨利YTD累計、EPS含年化估算、ROA、ROE年化）",
+            "四、流動性與現金流分析（現金及約當現金、營業活動現金流、流動性評估）",
+            "五、信用風險評估（主要風險因子、與同業比較、財務健康度綜合判斷）",
+            "六、授信建議（明確給出：正常往來／加強注意／限制往來／婉拒授信，並說明主要依據）",
         ],
         "detailed": [
             "一、公司基本資料與產業背景",
@@ -712,6 +807,10 @@ def generate_credit_report_prompt(
 - 表格資料以文字列點方式呈現，不使用管道符號（|）
 - 不使用 emoji 符號（📌、⚠️ 等）
 - 計算公式以文字方式呈現，不使用 LaTeX 或程式碼區塊
+- 【嚴格禁止】不得在報告中提及、比較或警示任何其他公司，受查公司已明確指定，請勿自行推測或添加其他公司名稱、股票代號或備註說明
+- 【嚴格禁止】不得添加任何「備註說明」章節提及其他公司與受查公司之差異
+- 【必須執行】第六章授信建議必須給出明確等級（正常往來／加強注意／限制往來／婉拒授信）並說明依據
+- 【必須執行】趨勢分析必須使用相同季度比較（如2022Q3、2023Q3、2024Q3），不得混用Q4全年與Q3前三季
 
 【財務數據】
 請將從 get_credit_summary 和 get_risk_indicators 工具取得的數據
