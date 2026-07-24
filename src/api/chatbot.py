@@ -27,6 +27,7 @@ PIPELINE_TIMEOUT_SECONDS = int(os.getenv("PIPELINE_TIMEOUT", "180"))
 async def get_chatbot_answer(
     user_input: str,
     bypass_cache: bool = Query(default=False, description="Skip cache and run full pipeline"),
+    mode: str = Query(default="auto", description="Model routing: auto|lookup|reasoning|classify|analysis"),
 ):
     start = time.perf_counter()
 
@@ -55,7 +56,7 @@ async def get_chatbot_answer(
     # ── Full pipeline with timeout ────────────────────────────
     try:
         graph_answer = await asyncio.wait_for(
-            asyncio.to_thread(graph.invoke, {"user_input": user_input}),
+            asyncio.to_thread(graph.invoke, {"user_input": user_input, "mode": mode}),
             timeout=PIPELINE_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:
@@ -84,6 +85,7 @@ async def get_chatbot_answer(
     print("=" * 60)
     print(f"🤖 Model    : {MODEL_NAME} ({PROVIDER})")
     print(f"❓ Question : {user_input[:60]}")
+    print(f"🎯 Mode     : {mode}")
     print(f"⏱️  Runtime  : {elapsed}s")
     print(f"📦 Cached   : No (fresh run)")
     print(f"📝 Answer   :")
