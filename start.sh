@@ -112,7 +112,7 @@ else
     MENGZI_DIR=$(find "$HOME/AITC" -name "mengzi_server.py" 2>/dev/null | head -1)
     if [ -n "$MENGZI_DIR" ]; then
         cd "$(dirname $MENGZI_DIR)"
-        nohup python mengzi_server.py > "$LOG_DIR/mengzi.log" 2>&1 &
+        nohup /home/user/vllm-install/.vllm/bin/python3 mengzi_server.py > "$LOG_DIR/mengzi.log" 2>&1 &
         echo $! > "$LOG_DIR/mengzi.pid"
         cd "$PROJECT_DIR"
         wait_for_port 3002 "Mengzi classifier" 20
