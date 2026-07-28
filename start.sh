@@ -162,20 +162,6 @@ else
 fi
 echo ""
 
-# Service 7: Fin-R1 on port 8005 (financial reasoning)
-log "Service 7: Fin-R1 AWQ on port 8005..."
-if ss -tlnp | grep -q ":8005 "; then
-    ok "Fin-R1 already running on port 8005 — skipping"
-else
-    VLLM_USE_FLASHINFER_SAMPLER=0 nohup $VLLM_PYTHON -m vllm.entrypoints.openai.api_server \
-        --model "$FINR1_SNAPSHOT" \
-        --host 0.0.0.0 --port 8005 \
-        --gpu-memory-utilization 0.10 \
-        --max-model-len 8192 \
-        > "$LOG_DIR/finr1.log" 2>&1 &
-    echo $! > "$LOG_DIR/finr1.pid"
-    wait_for_port 8005 "Fin-R1 AWQ" 120
-fi
 echo ""
 
 # ── Health check ──────────────────────────────────────────────
@@ -198,7 +184,7 @@ check_port 3002 "Mengzi Classifier   "
 check_port $XBRL_PORT "MCP Server (XBRL)  "
 check_port 8000 "Qwen2.5-14B (vLLM) "
 check_port 8001 "Qwen2.5-3B (vLLM)  "
-check_port 8005 "Fin-R1 AWQ (vLLM)  "
+
 
 echo ""
 echo -e "  Logs  →  ${BLUE}$LOG_DIR/${NC}"

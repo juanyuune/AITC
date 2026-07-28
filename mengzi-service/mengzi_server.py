@@ -81,6 +81,16 @@ LABEL_PROTOTYPES = {
         "財務狀況是否良好",
         "這個比率算偏高還是偏低",
     ],
+    "screening": [
+        "哪幾家金控負債比率超過FSC警示線",
+        "台灣所有銀行2024Q3負債比率排名",
+        "ROA最高的金融機構是哪家",
+        "哪些機構財務風險較高",
+        "全體金融機構負債比率比較",
+        "哪家金控財務最穩健",
+        "篩選出警示或高風險機構",
+        "比較所有金控的獲利能力",
+    ],
 }
 
 # Route label to agent mapping
@@ -90,6 +100,7 @@ LABEL_TO_AGENT = {
     "ratio_calc":     "finr1",
     "reasoning":      "finr1",
     "classification": "mengzi",
+    "screening":      "screen",
 }
 
 def _mean_pool(model_output, attention_mask):

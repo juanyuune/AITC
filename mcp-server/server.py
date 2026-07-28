@@ -843,3 +843,181 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
     uvicorn.run(mcp.sse_app(), host=SERVER_HOST, port=SERVER_PORT, log_level="info")
+
+@mcp.tool()
+def screen_all_institutions(period: str, metric: str = "負債比率", threshold: float = None) -> str:
+    """
+    Screen ALL 26 FSC-regulated institutions for a given period and metric.
+    Returns ranked table with FSC compliance judgment for each institution.
+    
+    Args:
+        period:    e.g. "2024Q3"
+        metric:    "負債比率" | "ROA" | "ROE" | "總資產" | "本期淨利" | "每股盈餘"
+        threshold: optional filter — only return institutions above this value
+    
+    Use this for:
+    - "哪幾家金控負債比率超過FSC警示線"
+    - "台灣所有銀行2024Q3負債比率排名"
+    - "ROA最高的金融機構是哪家"
+    """
+    try:
+        year, quarter = parse_period(period)
+        q = quarter if quarter else "Q4"
+        
+        # All 26 company codes
+        ALL_COMPANIES = [
+            "2801","2809","2812","2834","2838","2845",
+            "2850","2851","2852","2867",
+            "2880","2881","2882","2883","2884","2885",
+            "2886","2887","2888","2889","2890","2891","2892",
+            "2905","5834","5876"
+        ]
+        
+        # FSC thresholds by institution type
+        FSC_THRESHOLDS = {
+            "FH":   {"normal": 93, "warning": 96},
+            "BASI": {"normal": 94, "warning": 97},
+            "INS":  {"normal": 96, "warning": 98.5},
+            "MIM":  {"normal": 93, "warning": 96},
+        }
+        
+        results = []
+        
+        with get_db() as conn:
+            for code in ALL_COMPANIES:
+                try:
+                    # Get institution type
+                    ri = conn.execute(
+                        "SELECT company_code, industry_type FROM report_instance "
+                        "WHERE company_code=? AND year=? AND quarter=? LIMIT 1",
+                        (code, year, q)
+                    ).fetchone()
+                    if not ri:
+                        continue
+                    
+                    industry = ri[1] if ri[1] else "FH"
+                    company_name = get_company_name(code)
+                    
+                    # Get assets and liabilities for debt ratio
+                    ytd_start = f"{year}-01-01"
+                    ytd_end   = f"{year}-{_Q_WINDOWS.get(q, ('01-01','12-31'))[1]}"
+                    
+                    assets_row = conn.execute("""
+                        SELECT fmv.value FROM financial_metric_value fmv
+                        JOIN report_instance ri ON ri.report_id = fmv.report_id
+                        LEFT JOIN xbrl_fact xf ON xf.fact_id = fmv.fact_id
+                        WHERE ri.company_code=? AND ri.year=? AND ri.quarter=?
+                        AND fmv.concept_id IN ('ifrs-full_Assets','ifrs-full_EquityAndLiabilities')
+                        AND fmv.value IS NOT NULL AND xf.instant_date = ri.period_end
+                        AND xf.segment_json IS NULL
+                        ORDER BY ABS(fmv.value) DESC LIMIT 1
+                    """, (code, year, q)).fetchone()
+                    
+                    liab_row = conn.execute("""
+                        SELECT fmv.value FROM financial_metric_value fmv
+                        JOIN report_instance ri ON ri.report_id = fmv.report_id
+                        LEFT JOIN xbrl_fact xf ON xf.fact_id = fmv.fact_id
+                        WHERE ri.company_code=? AND ri.year=? AND ri.quarter=?
+                        AND fmv.concept_id = 'ifrs-full_Liabilities'
+                        AND fmv.value IS NOT NULL AND xf.instant_date = ri.period_end
+                        AND xf.segment_json IS NULL
+                        ORDER BY ABS(fmv.value) DESC LIMIT 1
+                    """, (code, year, q)).fetchone()
+                    
+                    income_row = conn.execute("""
+                        SELECT fmv.value FROM financial_metric_value fmv
+                        JOIN report_instance ri ON ri.report_id = fmv.report_id
+                        LEFT JOIN xbrl_fact xf ON xf.fact_id = fmv.fact_id
+                        WHERE ri.company_code=? AND ri.year=? AND ri.quarter=?
+                        AND fmv.concept_id IN ('ifrs-full_ProfitLossFromContinuingOperations','ifrs-full_ProfitLoss')
+                        AND fmv.value IS NOT NULL
+                        AND xf.period_start=? AND xf.period_end=?
+                        AND xf.segment_json IS NULL
+                        ORDER BY ABS(fmv.value) DESC LIMIT 1
+                    """, (code, year, q, ytd_start, ytd_end)).fetchone()
+                    
+                    equity_row = conn.execute("""
+                        SELECT fmv.value FROM financial_metric_value fmv
+                        JOIN report_instance ri ON ri.report_id = fmv.report_id
+                        LEFT JOIN xbrl_fact xf ON xf.fact_id = fmv.fact_id
+                        WHERE ri.company_code=? AND ri.year=? AND ri.quarter=?
+                        AND fmv.concept_id IN ('ifrs-full_EquityAttributableToOwnersOfParent','ifrs-full_Equity')
+                        AND fmv.value IS NOT NULL AND xf.instant_date = ri.period_end
+                        AND xf.segment_json IS NULL
+                        ORDER BY ABS(fmv.value) DESC LIMIT 1
+                    """, (code, year, q)).fetchone()
+                    
+                    if not assets_row or not liab_row:
+                        continue
+                    
+                    assets = float(assets_row[0])
+                    liab   = float(liab_row[0])
+                    income = float(income_row[0]) if income_row else 0
+                    equity = float(equity_row[0]) if equity_row else 0
+                    
+                    dr  = round(liab/assets*100, 2) if assets else 0
+                    
+                    # Annualise income
+                    annualise = {"Q1":4.0,"Q2":2.0,"Q3":4/3,"Q4":1.0}.get(q,4/3)
+                    roa = round(income*annualise/assets*100, 2) if assets else 0
+                    roe = round(income*annualise/equity*100, 2) if equity else 0
+                    
+                    # FSC judgment
+                    t = FSC_THRESHOLDS.get(industry, FSC_THRESHOLDS["FH"])
+                    if dr < t["normal"]:   fsc = "正常"
+                    elif dr < t["warning"]: fsc = "警示"
+                    else:                   fsc = "高風險"
+                    
+                    # Select requested metric value
+                    metric_value = {
+                        "負債比率": dr,
+                        "ROA": roa,
+                        "ROE": roe,
+                        "總資產": round(assets/100000, 0),
+                        "本期淨利": round(income/100000, 0),
+                    }.get(metric, dr)
+                    
+                    if threshold is not None and metric_value < threshold:
+                        continue
+                    
+                    results.append({
+                        "company_code": code,
+                        "company_name": company_name,
+                        "industry_type": industry,
+                        "assets_yi": round(assets/100000, 0),
+                        "debt_ratio": dr,
+                        "roa": roa,
+                        "roe": roe,
+                        "net_income_yi": round(income/100000, 0),
+                        "fsc_judgment": fsc,
+                        "metric_value": metric_value,
+                    })
+                    
+                except Exception as e:
+                    continue
+        
+        # Sort by metric value descending
+        results.sort(key=lambda x: x["metric_value"], reverse=True)
+        
+        # Build summary
+        warning_count  = sum(1 for r in results if r["fsc_judgment"] == "警示")
+        highrisk_count = sum(1 for r in results if r["fsc_judgment"] == "高風險")
+        normal_count   = sum(1 for r in results if r["fsc_judgment"] == "正常")
+        
+        import json as _json
+        return _json.dumps({
+            "period": period,
+            "metric": metric,
+            "total_institutions": len(results),
+            "fsc_summary": {
+                "正常": normal_count,
+                "警示": warning_count,
+                "高風險": highrisk_count
+            },
+            "ranked_institutions": results,
+            "note": f"資料來源：台灣金管會MOPS XBRL官方申報。期間：{period}。排序：{metric}由高至低。"
+        }, ensure_ascii=False, indent=2)
+        
+    except Exception as e:
+        import json as _json
+        return _json.dumps({"error": str(e)}, ensure_ascii=False)
