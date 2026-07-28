@@ -104,20 +104,20 @@ else
 fi
 echo ""
 
-# ── Service 4: Mengzi Classifier (port 3002) ─────────────────
-log "Service 4: Mengzi classifier (port 3002)..."
+# ── Service 4: BGE-M3 Semantic Router (port 3002) ───────────
+log "Service 4: BGE-M3 semantic router (port 3002)..."
 if lsof -i :3002 &>/dev/null; then
-    ok "Mengzi already running on port 3002 — skipping"
+    ok "BGE-M3 router already running on port 3002 — skipping"
 else
-    MENGZI_DIR=$(find "$HOME/AITC" -name "mengzi_server.py" 2>/dev/null | head -1)
-    if [ -n "$MENGZI_DIR" ]; then
-        cd "$(dirname $MENGZI_DIR)"
-        nohup /home/user/vllm-install/.vllm/bin/python3 mengzi_server.py > "$LOG_DIR/mengzi.log" 2>&1 &
-        echo $! > "$LOG_DIR/mengzi.pid"
+    BGE_DIR=$(find "$HOME/AITC" -name "bge_router.py" 2>/dev/null | head -1)
+    if [ -n "$BGE_DIR" ]; then
+        cd "$(dirname $BGE_DIR)"
+        nohup /home/user/vllm-install/.vllm/bin/python3 bge_router.py > "$LOG_DIR/bge_router.log" 2>&1 &
+        echo $! > "$LOG_DIR/bge_router.pid"
         cd "$PROJECT_DIR"
-        wait_for_port 3002 "Mengzi classifier" 20
+        wait_for_port 3002 "BGE-M3 router" 20
     else
-        warn "mengzi_server.py not found — skipping"
+        warn "bge_router.py not found — skipping"
     fi
 fi
 echo ""
@@ -180,7 +180,7 @@ check_port() {
 
 check_port 3000 "Next.js Frontend    "
 check_port 3001 "FastAPI Backend     "
-check_port 3002 "Mengzi Classifier   "
+check_port 3002 "BGE-M3 Router      "
 check_port $XBRL_PORT "MCP Server (XBRL)  "
 check_port 8000 "Qwen2.5-14B (vLLM) "
 check_port 8001 "Qwen2.5-3B (vLLM)  "
