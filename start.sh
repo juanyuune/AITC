@@ -75,7 +75,7 @@ if lsof -i :3001 &>/dev/null; then
     ok "FastAPI already running on port 3001 — skipping"
 else
     cd "$AGENT_DIR"
-    nohup uvicorn app:app \
+    nohup /home/user/mcp-venv/bin/uvicorn app:app \
         --host 0.0.0.0 \
         --port 3001 \
         --workers 1 \
@@ -122,16 +122,59 @@ else
 fi
 echo ""
 
-# ── Qwen/Fin-R1 (blocked by memory) ──────────────────────────
-log "Checking GPU memory for Qwen2.5-14B / Fin-R1 AWQ..."
-ROOT_MEM=$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader 2>/dev/null | grep -v "^$" | awk '{sum+=$2} END{print sum}')
-if [ -z "$ROOT_MEM" ]; then
-    warn "nvidia-smi not available or no GPU processes"
-elif [ "$ROOT_MEM" -gt 60000 ]; then
-    warn "GPU memory usage ~${ROOT_MEM}MiB — insufficient for Qwen/Fin-R1 (need ~15GiB free)"
-    warn "Kill root Qwen3-30B (pid 3329722) and re-run start.sh to activate these models"
+# ── vLLM Model Services ───────────────────────────────────────
+QWEN_SNAPSHOT="/home/user/.cache/huggingface/hub/models--Qwen--Qwen2.5-14B-Instruct-AWQ/snapshots/539535859b135b0244c91f3e59816150c8056698/"
+QWEN3B_SNAPSHOT="/home/user/.cache/huggingface/hub/models--Qwen--Qwen2.5-3B-Instruct-AWQ/snapshots/3559b226e8ce77211e2c1bd7ddfb7686fec4d6dd/"
+FINR1_SNAPSHOT="/home/user/.cache/huggingface/hub/Fin-R1-AWQ/"
+VLLM_PYTHON="/home/user/vllm-install/.vllm/bin/python3"
+
+# Service 5: Qwen2.5-14B on port 8000 (data retrieval)
+log "Service 5: Qwen2.5-14B on port 8000..."
+if ss -tlnp | grep -q ":8000 "; then
+    ok "Qwen2.5-14B already running on port 8000 — skipping"
 else
-    ok "GPU memory available — consider starting Qwen2.5-14B on port 8000"
+    VLLM_USE_FLASHINFER_SAMPLER=0 nohup $VLLM_PYTHON -m vllm.entrypoints.openai.api_server \
+        --model "$QWEN_SNAPSHOT" \
+        --host 0.0.0.0 --port 8000 \
+        --quantization awq \
+        --gpu-memory-utilization 0.25 \
+        --max-model-len 8192 \
+        > "$LOG_DIR/qwen.log" 2>&1 &
+    echo $! > "$LOG_DIR/qwen.pid"
+    wait_for_port 8000 "Qwen2.5-14B" 120
+fi
+echo ""
+
+# Service 6: Qwen2.5-3B on port 8001 (ratio calculation agent)
+log "Service 6: Qwen2.5-3B on port 8001..."
+if ss -tlnp | grep -q ":8001 "; then
+    ok "Qwen2.5-3B already running on port 8001 — skipping"
+else
+    VLLM_USE_FLASHINFER_SAMPLER=0 nohup $VLLM_PYTHON -m vllm.entrypoints.openai.api_server \
+        --model "$QWEN3B_SNAPSHOT" \
+        --host 0.0.0.0 --port 8001 \
+        --quantization awq \
+        --gpu-memory-utilization 0.05 \
+        --max-model-len 4096 \
+        > "$LOG_DIR/qwen3b.log" 2>&1 &
+    echo $! > "$LOG_DIR/qwen3b.pid"
+    wait_for_port 8001 "Qwen2.5-3B" 60
+fi
+echo ""
+
+# Service 7: Fin-R1 on port 8005 (financial reasoning)
+log "Service 7: Fin-R1 AWQ on port 8005..."
+if ss -tlnp | grep -q ":8005 "; then
+    ok "Fin-R1 already running on port 8005 — skipping"
+else
+    VLLM_USE_FLASHINFER_SAMPLER=0 nohup $VLLM_PYTHON -m vllm.entrypoints.openai.api_server \
+        --model "$FINR1_SNAPSHOT" \
+        --host 0.0.0.0 --port 8005 \
+        --gpu-memory-utilization 0.10 \
+        --max-model-len 8192 \
+        > "$LOG_DIR/finr1.log" 2>&1 &
+    echo $! > "$LOG_DIR/finr1.pid"
+    wait_for_port 8005 "Fin-R1 AWQ" 120
 fi
 echo ""
 
@@ -154,7 +197,8 @@ check_port 3001 "FastAPI Backend     "
 check_port 3002 "Mengzi Classifier   "
 check_port $XBRL_PORT "MCP Server (XBRL)  "
 check_port 8000 "Qwen2.5-14B (vLLM) "
-check_port 8004 "Fin-R1 AWQ (vLLM)  "
+check_port 8001 "Qwen2.5-3B (vLLM)  "
+check_port 8005 "Fin-R1 AWQ (vLLM)  "
 
 echo ""
 echo -e "  Logs  →  ${BLUE}$LOG_DIR/${NC}"
