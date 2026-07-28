@@ -105,6 +105,16 @@ LABEL_PROTOTYPES = {
         "找出高風險金融機構",
         "哪些保險公司超過FSC門檻",
     ],
+    "comparison": [
+        "比較國泰金控與富邦金控2024Q3財務結構",
+        "國泰金控和富邦金控哪個負債比率較低",
+        "比較兆豐金控與中信金控的ROA ROE",
+        "國泰金控與彰化銀行財務風險比較",
+        "比較兩家金控的獲利能力",
+        "哪家金控財務結構更穩健",
+        "國泰金控和玉山金控EPS比較",
+        "三家銀行負債比率比較分析",
+    ],
 }
 
 LABEL_TO_AGENT = {
@@ -112,6 +122,7 @@ LABEL_TO_AGENT = {
     "lookup":     "qwen14b",
     "ratio_calc": "qwen3b",
     "screening":  "screen",
+    "comparison": "compare",
 }
 
 def _encode(texts: list) -> torch.Tensor:

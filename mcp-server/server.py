@@ -1021,3 +1021,146 @@ def screen_all_institutions(period: str, metric: str = "負債比率", threshold
     except Exception as e:
         import json as _json
         return _json.dumps({"error": str(e)}, ensure_ascii=False)
+
+
+@mcp.tool()
+def compare_institutions(company_codes: list, period: str) -> str:
+    """
+    Professional side-by-side comparison of 2-3 FSC institutions.
+    Returns comprehensive financial metrics, ratios, and FSC compliance
+    for all companies in one call.
+    
+    Args:
+        company_codes: list of 2-3 company codes e.g. ["2882", "2881"]
+        period:        e.g. "2024Q3"
+    
+    Use for:
+    - "比較國泰金控與富邦金控2024Q3財務結構"
+    - "國泰金控和彰化銀行哪個負債比率較低"
+    - "比較三家金控的ROA ROE表現"
+    """
+    import json as _json
+
+    FSC_THRESHOLDS = {
+        "FH":   {"normal": 93, "warning": 96},
+        "BASI": {"normal": 94, "warning": 97},
+        "INS":  {"normal": 96, "warning": 98.5},
+        "MIM":  {"normal": 93, "warning": 96},
+    }
+    INDUSTRY_LABEL = {
+        "FH": "金融控股公司", "BASI": "銀行業",
+        "INS": "保險業", "MIM": "投資控股",
+    }
+
+    try:
+        year, quarter = parse_period(period)
+        q = quarter or "Q4"
+        annualise = {"Q1":4.0,"Q2":2.0,"Q3":4/3,"Q4":1.0}.get(q, 4/3)
+        ytd_map = {"Q1":"前一季累計","Q2":"前二季累計","Q3":"前三季累計","Q4":"全年累計"}
+        ytd = ytd_map.get(q, "累計")
+
+        companies = []
+
+        with get_db() as conn:
+            for code in company_codes[:3]:  # max 3 companies
+                try:
+                    ri = conn.execute(
+                        "SELECT industry_type, period_end FROM report_instance "
+                        "WHERE company_code=? AND year=? AND quarter=? LIMIT 1",
+                        (code, year, q)
+                    ).fetchone()
+                    if not ri:
+                        continue
+
+                    industry = ri[0] or "FH"
+                    company_name = get_company_name(code)
+
+                    # Fetch key metrics
+                    def get_val(concept_ids, instant=True):
+                        for cid in concept_ids:
+                            if instant:
+                                row = conn.execute("""
+                                    SELECT xf.value_numeric FROM xbrl_fact xf
+                                    JOIN report_instance ri ON ri.report_id = xf.report_id
+                                    WHERE ri.company_code=? AND ri.year=? AND ri.quarter=?
+                                    AND xf.concept_id=? AND xf.instant_date=ri.period_end
+                                    AND xf.segment_json IS NULL AND xf.value_numeric IS NOT NULL
+                                    ORDER BY ABS(xf.value_numeric) DESC LIMIT 1
+                                """, (code, year, q, cid)).fetchone()
+                            else:
+                                row = conn.execute("""
+                                    SELECT xf.value_numeric FROM xbrl_fact xf
+                                    JOIN report_instance ri ON ri.report_id = xf.report_id
+                                    WHERE ri.company_code=? AND ri.year=? AND ri.quarter=?
+                                    AND xf.concept_id=? AND xf.period_start=ri.period_start
+                                    AND xf.period_end=ri.period_end
+                                    AND xf.segment_json IS NULL AND xf.value_numeric IS NOT NULL
+                                    ORDER BY ABS(xf.value_numeric) DESC LIMIT 1
+                                """, (code, year, q, cid)).fetchone()
+                            if row:
+                                return float(row[0])
+                        return None
+
+                    assets  = get_val(['ifrs-full_Assets','ifrs-full_EquityAndLiabilities'])
+                    liab    = get_val(['ifrs-full_Liabilities'])
+                    equity  = get_val(['ifrs-full_EquityAttributableToOwnersOfParent','ifrs-full_Equity'])
+                    income  = get_val(['ifrs-full_ProfitLoss','ifrs-full_ProfitLossFromContinuingOperations'], instant=False)
+                    eps     = get_val(['ifrs-full_BasicEarningsLossPerShare'], instant=False)
+                    cash    = get_val(['ifrs-full_CashAndCashEquivalents'])
+
+                    # Calculate ratios
+                    dr   = round(liab/assets*100, 2) if assets and liab else None
+                    roa  = round(income*annualise/assets*100, 2) if assets and income else None
+                    roe  = round(income*annualise/equity*100, 2) if equity and income else None
+                    eps_a = round(eps*annualise, 2) if eps else None
+
+                    # FSC judgment
+                    t = FSC_THRESHOLDS.get(industry, FSC_THRESHOLDS["FH"])
+                    if dr is not None:
+                        if dr < t["normal"]:   fsc = "正常"
+                        elif dr < t["warning"]: fsc = "警示"
+                        else:                   fsc = "高風險"
+                    else:
+                        fsc = "N/A"
+
+                    companies.append({
+                        "company_code":    code,
+                        "company_name":    company_name,
+                        "industry_type":   industry,
+                        "industry_label":  INDUSTRY_LABEL.get(industry, industry),
+                        "period":          period,
+                        "ytd":             ytd,
+                        "metrics": {
+                            "總資產_億元":     round(assets/100000000, 0) if assets else None,
+                            "總負債_億元":     round(liab/100000000, 0) if liab else None,
+                            "股東權益_億元":   round(equity/100000000, 0) if equity else None,
+                            f"{ytd}淨利_億元": round(income/100000000, 0) if income else None,
+                            f"{ytd}EPS":      round(eps, 2) if eps else None,
+                        },
+                        "ratios": {
+                            "負債比率":        f"{dr:.2f}%" if dr else "N/A",
+                            "ROA年化":         f"{roa:.2f}%" if roa else "N/A",
+                            "ROE年化":         f"{roe:.2f}%" if roe else "N/A",
+                            "EPS年化":         f"{eps_a:.2f}元" if eps_a else "N/A",
+                        },
+                        "fsc_judgment":    fsc,
+                        "fsc_thresholds":  t,
+                        "raw_ratios": {
+                            "dr": dr, "roa": roa, "roe": roe, "eps_a": eps_a
+                        }
+                    })
+                except Exception as e:
+                    continue
+
+        if not companies:
+            return _json.dumps({"error": "無法取得比較數據，請確認公司代號及期間"}, ensure_ascii=False)
+
+        return _json.dumps({
+            "comparison_period": period,
+            "companies_compared": len(companies),
+            "companies": companies,
+            "note": f"資料來源：台灣金管會MOPS XBRL官方申報。期間：{period}。",
+        }, ensure_ascii=False, indent=2)
+
+    except Exception as e:
+        return _json.dumps({"error": str(e)}, ensure_ascii=False)
