@@ -188,4 +188,14 @@ check_port 8001 "Qwen2.5-3B (vLLM)  "
 
 echo ""
 echo -e "  Logs  →  ${BLUE}$LOG_DIR/${NC}"
+
+# ── Warmup vLLM models after startup ─────────────────────────────
+log "Warming up vLLM models..."
+sleep 5
+# Warmup Qwen3B
+curl -s -X POST http://localhost:8001/v1/chat/completions   -H "Content-Type: application/json"   -d "{"model":"/home/user/.cache/huggingface/hub/models--Qwen--Qwen2.5-3B-Instruct-AWQ/snapshots/3559b226e8ce77211e2c1bd7ddfb7686fec4d6dd/","messages":[{"role":"user","content":"hello"}],"max_tokens":5}"   > /dev/null 2>&1 && ok "Qwen 2.5-3B warmed up" || warn "Qwen 2.5-3B warmup failed"
+# Warmup Qwen14B  
+curl -s -X POST http://localhost:8000/v1/chat/completions   -H "Content-Type: application/json"   -d "{"model":"/home/user/.cache/huggingface/hub/models--Qwen--Qwen2.5-14B-Instruct-AWQ/snapshots/539535859b135b0244c91f3e59816150c8056698/","messages":[{"role":"user","content":"hello"}],"max_tokens":5}"   > /dev/null 2>&1 && ok "Qwen 2.5-14B warmed up" || warn "Qwen 2.5-14B warmup failed"
+echo ""
+
 echo ""
