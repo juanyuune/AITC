@@ -52,7 +52,7 @@ wait_for_port() {
 
 # ── Helper: launch vLLM in background — no blocking wait ──────
 launch_vllm() {
-    local port=$1 label=$2 model=$3 gpu_util=$4 max_len=$5 logfile=$6 pidfile=$7
+    local port=$1 label=$2 model=$3 gpu_util=$4 max_len=$5 logfile=$6 pidfile=$7 extra_flags=${8:-}
     if ss -tlnp | grep -q ":$port "; then
         ok "$label already running on port $port — skipping"
         return 0
@@ -65,6 +65,7 @@ launch_vllm() {
         --quantization awq \
         --gpu-memory-utilization $gpu_util \
         --max-model-len $max_len \
+        $extra_flags \
         > "$LOG_DIR/$logfile" 2>&1 &
     echo $! > "$LOG_DIR/$pidfile"
     ok "$label process started (PID $!) — loading in background"
@@ -148,18 +149,26 @@ echo ""
 log "vLLM Models — launching in background (non-blocking)..."
 echo ""
 
-launch_vllm 8001 "Qwen2.5-3B" \
-    "$QWEN3B_SNAPSHOT" 0.05 4096 \
-    "qwen3b.log" "qwen3b.pid"
-
+# Launch 14B first — gets IPC socket before 3B initializes
 launch_vllm 8000 "Qwen2.5-14B" \
     "$QWEN_SNAPSHOT" 0.25 8192 \
     "qwen.log" "qwen.pid"
+sleep 10
+# Now launch 3B
+launch_vllm 8001 "Qwen2.5-3B" \
+    "$QWEN3B_SNAPSHOT" 0.05 4096 \
+    "qwen3b.log" "qwen3b.pid" "--enforce-eager"
+
 
 echo ""
 warn "vLLM models are loading in background — this takes 2-5 minutes"
 warn "FastAPI fallback chain is active — system is already serving requests"
 warn "Monitor model readiness: tail -f $LOG_DIR/aitc-model-ready.log"
+
+# Launch cache warmup in background after models are ready
+# Prevents cold start for first real user after every restart
+nohup bash "$AITC_DIR/warmup.sh" >> "$LOG_DIR/warmup.log" 2>&1 &
+echo "[$(date '+%H:%M:%S')] Cache warmup launched (PID=$!) — pre-populating response cache" >> "$READY_LOG"
 echo ""
 
 # ── Background readiness monitor ─────────────────────────────

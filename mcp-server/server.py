@@ -540,17 +540,19 @@ def get_credit_summary(company_code: str, period: str) -> str:
                             ORDER BY ABS(fmv.value) DESC LIMIT 1
                         """, (company_code, year, q or "Q4", concept)).fetchone()
                     else:
-                        # Income/CF: match YTD period (period_start=year-01-01)
+                        # Income/CF: query xbrl_fact directly for YTD period
+                        # financial_metric_value only stores single-quarter facts
+                        # so YTD profit (Jan-Sep) must come from xbrl_fact directly
                         row = conn.execute("""
-                            SELECT fmv.value, xf.decimals, xf.unit_id, ri.period_end
-                            FROM financial_metric_value fmv
-                            JOIN report_instance ri ON ri.report_id = fmv.report_id
-                            LEFT JOIN xbrl_fact xf ON xf.fact_id = fmv.fact_id
+                            SELECT xf.value_numeric, xf.decimals, xf.unit_id, ri.period_end
+                            FROM xbrl_fact xf
+                            JOIN report_instance ri ON ri.report_id = xf.report_id
                             WHERE ri.company_code = ? AND ri.year = ? AND ri.quarter = ?
-                            AND fmv.concept_id = ? AND fmv.value IS NOT NULL
+                            AND xf.concept_id = ? AND xf.value_numeric IS NOT NULL
+                            AND xf.value_numeric != 0
                             AND xf.period_start = ? AND xf.period_end = ?
-                            AND xf.segment_json IS NULL
-                            ORDER BY ABS(fmv.value) DESC LIMIT 1
+                            AND (xf.segment_json IS NULL OR xf.segment_json = '[]')
+                            ORDER BY ABS(xf.value_numeric) DESC LIMIT 1
                         """, (company_code, year, q or "Q4", concept, ytd_start, ytd_end)).fetchone()
                     if row:
                         raw, dec, unit, period_end = row
@@ -676,18 +678,26 @@ def get_risk_indicators(company_code: str, periods: list) -> str:
                     return None
 
                 def fetch_ytd(concepts):
-                    """Income/CF items — YTD cumulative (period_start=year-01-01)."""
+                    """Income/CF items — YTD cumulative (period_start=year-01-01).
+                    Queries xbrl_fact directly to get full YTD period data.
+                    financial_metric_value only stores single-quarter facts so
+                    YTD profit (Jan-Sep) was missing — this fixes ROA/ROE = 0 bug.
+                    """
                     for concept in concepts:
                         row = conn.execute("""
-                            SELECT fmv.value, xf.decimals
-                            FROM financial_metric_value fmv
-                            JOIN report_instance ri ON ri.report_id = fmv.report_id
-                            LEFT JOIN xbrl_fact xf ON xf.fact_id = fmv.fact_id
-                            WHERE ri.company_code = ? AND ri.year = ? AND ri.quarter = ?
-                            AND fmv.concept_id = ? AND fmv.value IS NOT NULL
-                            AND xf.period_start = ? AND xf.period_end = ?
-                            AND xf.segment_json IS NULL
-                            ORDER BY ABS(fmv.value) DESC LIMIT 1
+                            SELECT xf.value_numeric, xf.decimals
+                            FROM xbrl_fact xf
+                            JOIN report_instance ri ON ri.report_id = xf.report_id
+                            WHERE ri.company_code = ?
+                            AND ri.year = ?
+                            AND ri.quarter = ?
+                            AND xf.concept_id = ?
+                            AND xf.value_numeric IS NOT NULL
+                            AND xf.value_numeric != 0
+                            AND xf.period_start = ?
+                            AND xf.period_end = ?
+                            AND (xf.segment_json IS NULL OR xf.segment_json = '[]')
+                            ORDER BY ABS(xf.value_numeric) DESC LIMIT 1
                         """, (company_code, year, q, concept, _ytd_start, _ytd_end)).fetchone()
                         if row:
                             raw, dec = row
