@@ -370,16 +370,12 @@ def get_trend_data(
             if not parsed:
                 return json.dumps({"error": f"No periods found for {company_code}"})
 
-            # Build per-period clauses that also pin the period dates, so we
-            # never pick prior-year comparatives or the YTD duplicate.
+            # Filter by year and quarter only — financial_metric_value stores
+            # balance sheet snapshots without period_start/period_end dates.
             clauses, period_params = [], []
             for (yy, qq) in parsed:
-                s_start, s_end, _, _ = period_bounds(yy, qq)
-                clauses.append(
-                    "(fmv.year = ? AND fmv.quarter = ? "
-                    "AND fmv.period_start = ? AND fmv.period_end = ?)"
-                )
-                period_params.extend([yy, qq, s_start, s_end])
+                clauses.append("(fmv.year = ? AND fmv.quarter = ?)")
+                period_params.extend([yy, qq])
             period_filter = " OR ".join(clauses)
             ph = ",".join("?" * len(fields))
             field_params = fields + fields
