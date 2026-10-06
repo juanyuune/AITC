@@ -82,3 +82,22 @@ python3 aitc-check.py
 ```
 
 Expected output: `Checked N item(s). OK — all checks passed, 0 issues.`
+
+---
+
+## Deployment Modes
+
+### Mode A — DGX Terminal (demo and power users)
+Use `.mcp.json` as-is. Launch Claude Code directly on the DGX:
+```bash
+cd /home/user/AITC/plugins/aitc-credit-investigation
+claude
+```
+
+### Mode B — Analyst Workstations
+Copy the plugin directory to the analyst machine. Replace `.mcp.json` with `.mcp.workstation.json`:
+```bash
+cp .mcp.workstation.json .mcp.json
+claude
+```
+Requires Claude Code installed on the workstation and port 8091 reachable from the analyst network (192.168.20.169:8091).

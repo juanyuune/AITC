@@ -146,18 +146,11 @@ echo ""
 # The fallback chain handles requests until they are ready.
 # Monitor readiness: tail -f ~/AITC/logs/aitc-model-ready.log
 
-log "vLLM Models — launching in background (non-blocking)..."
+log "vLLM Models — using Qwen3-30B Docker container on port 33000 (always running)..."
 echo ""
-
-# Launch 14B first — gets IPC socket before 3B initializes
-launch_vllm 8000 "Qwen2.5-14B" \
-    "$QWEN_SNAPSHOT" 0.25 8192 \
-    "qwen.log" "qwen.pid"
-sleep 10
-# Now launch 3B
-launch_vllm 8001 "Qwen2.5-3B" \
-    "$QWEN3B_SNAPSHOT" 0.05 4096 \
-    "qwen3b.log" "qwen3b.pid" "--enforce-eager"
+# Qwen 2.5-3B and Qwen 2.5-14B removed — replaced by Qwen3-30B Docker container
+# Container: vllm-server2604-Qwen3-30B-A3B-Instruct-2507-GPTQ-Int4 on port 33000
+# To start if not running: ~/docker-vllm-scripts/start_vllm_docker_Qwen3-30B-A3B-Instruct-2507-GPTQ-Int4.sh
 
 
 echo ""
@@ -178,42 +171,24 @@ echo ""
     READY_LOG="$LOG_DIR/aitc-model-ready.log"
     echo "[$(date '+%H:%M:%S')] Model readiness monitor started" > "$READY_LOG"
 
-    qwen3b_ready=false
-    qwen14b_ready=false
 
-    for i in $(seq 1 300); do
-        sleep 2
+    qwen3_ready=false
 
-        if [ "$qwen3b_ready" = false ] && ss -tlnp | grep -q ":8001 "; then
-            # Verify model actually responds
-            if curl -s --max-time 3 http://localhost:8001/v1/models | grep -q "id"; then
-                qwen3b_ready=true
-                echo "[$(date '+%H:%M:%S')] ✅ Qwen 2.5-3B ready on port 8001 (${i}0s after launch)" >> "$READY_LOG"
-                # Warmup
-                curl -s -X POST http://localhost:8001/v1/chat/completions \
+    for i in $(seq 1 60); do
+        sleep 5
+
+        if [ "$qwen3_ready" = false ]; then
+            if curl -s --max-time 3 http://localhost:33000/v1/models | grep -q "id"; then
+                qwen3_ready=true
+                echo "[$(date '+%H:%M:%S')] ✅ Qwen3-30B ready on port 33000 (Docker)" >> "$READY_LOG"
+                curl -s -X POST http://localhost:33000/v1/chat/completions \
                     -H "Content-Type: application/json" \
-                    -d "{\"model\":\"$QWEN3B_SNAPSHOT\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"max_tokens\":5}" \
+                    -d '{"model":"JunHowie/Qwen3-30B-A3B-Instruct-2507-GPTQ-Int4","messages":[{"role":"user","content":"hello"}],"max_tokens":5}' \
                     > /dev/null 2>&1
-                echo "[$(date '+%H:%M:%S')] ✅ Qwen 2.5-3B warmup complete" >> "$READY_LOG"
+                echo "[$(date '+%H:%M:%S')] ✅ Qwen3-30B warmup complete" >> "$READY_LOG"
+                echo "[$(date '+%H:%M:%S')] ✅ All models ready — system fully operational" >> "$READY_LOG"
+                break
             fi
-        fi
-
-        if [ "$qwen14b_ready" = false ] && ss -tlnp | grep -q ":8000 "; then
-            if curl -s --max-time 3 http://localhost:8000/v1/models | grep -q "id"; then
-                qwen14b_ready=true
-                echo "[$(date '+%H:%M:%S')] ✅ Qwen 2.5-14B ready on port 8000 (${i}0s after launch)" >> "$READY_LOG"
-                # Warmup
-                curl -s -X POST http://localhost:8000/v1/chat/completions \
-                    -H "Content-Type: application/json" \
-                    -d "{\"model\":\"$QWEN_SNAPSHOT\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"max_tokens\":5}" \
-                    > /dev/null 2>&1
-                echo "[$(date '+%H:%M:%S')] ✅ Qwen 2.5-14B warmup complete" >> "$READY_LOG"
-            fi
-        fi
-
-        if [ "$qwen3b_ready" = true ] && [ "$qwen14b_ready" = true ]; then
-            echo "[$(date '+%H:%M:%S')] ✅ All models ready — system fully operational" >> "$READY_LOG"
-            break
         fi
     done
 ) &
@@ -238,8 +213,8 @@ check_svc 3001 "FastAPI Backend     "
 check_svc 3002 "BGE-M3 Router      "
 check_svc $XBRL_PORT "MCP Server (XBRL)  "
 echo ""
-echo -e "  ${YELLOW}⏳${NC} Qwen 2.5-3B  → loading in background (port 8001)"
-echo -e "  ${YELLOW}⏳${NC} Qwen 2.5-14B → loading in background (port 8000)"
+echo -e "  ${GREEN}✅${NC} Qwen3-30B     → Docker container on port 33000 (always running)"
+
 echo ""
 echo -e "  Monitor: ${BLUE}tail -f $LOG_DIR/aitc-model-ready.log${NC}"
 echo -e "  Logs:    ${BLUE}$LOG_DIR/${NC}"
