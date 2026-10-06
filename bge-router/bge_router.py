@@ -8,14 +8,13 @@ Architecture:
   Native Traditional Chinese support
   Contrastive training for semantic similarity — perfect for routing
   
-  4 routing labels covering all analyst question types:
+  5 routing labels — fallback only (hard rules P1-P4 run first):
     analysis    → Claude Sonnet 4.6 (credit reports)
-    lookup      → Qwen 2.5-14B (data retrieval)
-    ratio_calc  → Qwen 2.5-3B (ratio calculation + FSC judgment)
-    screening   → MCP Screen (all 26 institutions)
+    lookup      → MCP get_credit_summary (direct DB query, 0.1s)
+    ratio_calc  → Qwen3-30B (ratio calculation + FSC judgment, ~1s)
+    screening   → MCP screen_all_institutions (all 26 institutions, ~3s)
+    comparison  → MCP compare_institutions (~1s)
 
-  Mengzi-BERT-fin removed as direct answer agent — Qwen3B covers
-  all ratio and health classification questions with better quality.
 """
 import time
 import torch
