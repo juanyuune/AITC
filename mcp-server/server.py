@@ -67,9 +67,9 @@ _COMPANY_NAMES = {
     "2834": "臺灣企銀股份有限公司",
     "2838": "聯邦商業銀行股份有限公司",
     "2845": "遠東國際商業銀行股份有限公司",
-    "2850": "新光人壽保險股份有限公司",
-    "2851": "寶瑞人壽保險股份有限公司",
-    "2852": "第一金人壽保險股份有限公司",
+    "2850": "新光產物保險股份有限公司",
+    "2851": "中央再保險股份有限公司",
+    "2852": "第一產物保險股份有限公司",
     "2867": "三商美邦人壽保險股份有限公司",
     "2880": "華南金融控股股份有限公司",
     "2881": "富邦金融控股股份有限公司",
@@ -84,8 +84,8 @@ _COMPANY_NAMES = {
     "2890": "永豐金融控股股份有限公司",
     "2891": "中國信託金融控股股份有限公司",
     "2892": "第一金融控股股份有限公司",
-    "2905": "三商金融控股股份有限公司",
-    "5834": "保誠人壽保險股份有限公司",
+    "2905": "三商投資控股股份有限公司",
+    "5834": "兆豐產物保險股份有限公司",
     "5876": "上海商業儲蓄銀行股份有限公司",
 }
 
@@ -504,8 +504,8 @@ def get_credit_summary(company_code: str, period: str) -> str:
             concepts = {
                 "總資產":        ["ifrs-full_Assets", "ifrs-full_EquityAndLiabilities"],
                 "總負債":        ["ifrs-full_Liabilities"],
-                "股東權益":      ["ifrs-full_EquityAttributableToOwnersOfParent", "ifrs-full_Equity"],
-                "本期淨利":      ["ifrs-full_ProfitLossFromContinuingOperations", "ifrs-full_ProfitLoss"],
+                "股東權益":      ["ifrs-full_Equity", "ifrs-full_EquityAttributableToOwnersOfParent"],
+                "本期淨利":      ["ifrs-full_ProfitLoss", "ifrs-full_ProfitLossFromContinuingOperations"],
                 "稅前淨利":      ["ifrs-full_ProfitLossBeforeTax"],
                 "每股盈餘":      ["ifrs-full_BasicEarningsLossPerShare"],
                 "現金及約當現金": ["ifrs-full_CashAndCashEquivalents"],
@@ -702,7 +702,8 @@ def get_risk_indicators(company_code: str, periods: list) -> str:
 
                 assets  = fetch_instant(["ifrs-full_Assets", "ifrs-full_EquityAndLiabilities"])
                 liab    = fetch_instant(["ifrs-full_Liabilities"])
-                equity  = fetch_instant(["ifrs-full_EquityAttributableToOwnersOfParent", "ifrs-full_Equity"])
+                # equity basis: total first (same basis as get_credit_summary)
+                equity  = fetch_instant(["ifrs-full_Equity", "ifrs-full_EquityAttributableToOwnersOfParent"])
                 income  = fetch_ytd(["ifrs-full_ProfitLossFromContinuingOperations", "ifrs-full_ProfitLoss"])
                 cfo     = fetch_ytd(["ifrs-full_CashFlowsFromUsedInOperatingActivities",
                                      "tifrs-SCF_CashFlowsFromUsedInOperatingActivities"])
@@ -850,6 +851,8 @@ if __name__ == "__main__":
 
     uvicorn.run(mcp.sse_app(), host=SERVER_HOST, port=SERVER_PORT, log_level="info")
 
+_TWD_PER_YI = 100_000_000   # 1億 = 10^8 TWD; XBRL facts are stored in whole TWD (decimals=-3)
+
 @mcp.tool()
 def screen_all_institutions(period: str, metric: str = "負債比率", threshold: float = None) -> str:
     """
@@ -867,6 +870,9 @@ def screen_all_institutions(period: str, metric: str = "負債比率", threshold
     - "ROA最高的金融機構是哪家"
     """
     try:
+        if metric not in ("負債比率", "ROA", "ROE", "總資產", "本期淨利", "每股盈餘"):
+            import json as _j0
+            return _j0.dumps({"error": f"不支援的篩選指標：{metric}"}, ensure_ascii=False)
         year, quarter = parse_period(period)
         q = quarter if quarter else "Q4"
         
@@ -888,6 +894,7 @@ def screen_all_institutions(period: str, metric: str = "負債比率", threshold
         }
         
         results = []
+        skipped = []   # institutions left out of this ranking, with the reason (never filled with 0)
         
         with get_db() as conn:
             for code in ALL_COMPANIES:
@@ -899,6 +906,7 @@ def screen_all_institutions(period: str, metric: str = "負債比率", threshold
                         (code, year, q)
                     ).fetchone()
                     if not ri:
+                        skipped.append({"company_code": code, "company_name": get_company_name(code), "reason": f"{period} 無申報資料"})
                         continue
                     
                     industry = ri[1] if ri[1] else "FH"
@@ -930,16 +938,28 @@ def screen_all_institutions(period: str, metric: str = "負債比率", threshold
                         ORDER BY ABS(fmv.value) DESC LIMIT 1
                     """, (code, year, q)).fetchone()
                     
+                    # Year-to-date profit and EPS come from xbrl_fact (same filter as fetch_ytd): for Q2/Q3
+                    # financial_metric_value links only the single-quarter fact, so the old query found nothing.
                     income_row = conn.execute("""
-                        SELECT fmv.value FROM financial_metric_value fmv
-                        JOIN report_instance ri ON ri.report_id = fmv.report_id
-                        LEFT JOIN xbrl_fact xf ON xf.fact_id = fmv.fact_id
+                        SELECT xf.value_numeric FROM xbrl_fact xf
+                        JOIN report_instance ri ON ri.report_id = xf.report_id
                         WHERE ri.company_code=? AND ri.year=? AND ri.quarter=?
-                        AND fmv.concept_id IN ('ifrs-full_ProfitLossFromContinuingOperations','ifrs-full_ProfitLoss')
-                        AND fmv.value IS NOT NULL
+                        AND xf.concept_id IN ('ifrs-full_ProfitLossFromContinuingOperations','ifrs-full_ProfitLoss')
+                        AND xf.value_numeric IS NOT NULL AND xf.value_numeric != 0
                         AND xf.period_start=? AND xf.period_end=?
-                        AND xf.segment_json IS NULL
-                        ORDER BY ABS(fmv.value) DESC LIMIT 1
+                        AND (xf.segment_json IS NULL OR xf.segment_json = '[]')
+                        ORDER BY ABS(xf.value_numeric) DESC LIMIT 1
+                    """, (code, year, q, ytd_start, ytd_end)).fetchone()
+
+                    eps_row = conn.execute("""
+                        SELECT xf.value_numeric FROM xbrl_fact xf
+                        JOIN report_instance ri ON ri.report_id = xf.report_id
+                        WHERE ri.company_code=? AND ri.year=? AND ri.quarter=?
+                        AND xf.concept_id = 'ifrs-full_BasicEarningsLossPerShare'
+                        AND xf.value_numeric IS NOT NULL
+                        AND xf.period_start=? AND xf.period_end=?
+                        AND (xf.segment_json IS NULL OR xf.segment_json = '[]')
+                        ORDER BY ABS(xf.value_numeric) DESC LIMIT 1
                     """, (code, year, q, ytd_start, ytd_end)).fetchone()
                     
                     equity_row = conn.execute("""
@@ -950,23 +970,25 @@ def screen_all_institutions(period: str, metric: str = "負債比率", threshold
                         AND fmv.concept_id IN ('ifrs-full_EquityAttributableToOwnersOfParent','ifrs-full_Equity')
                         AND fmv.value IS NOT NULL AND xf.instant_date = ri.period_end
                         AND xf.segment_json IS NULL
-                        ORDER BY ABS(fmv.value) DESC LIMIT 1
+                        ORDER BY CASE fmv.concept_id WHEN 'ifrs-full_Equity' THEN 0 ELSE 1 END, ABS(fmv.value) DESC LIMIT 1
                     """, (code, year, q)).fetchone()
                     
                     if not assets_row or not liab_row:
+                        skipped.append({"company_code": code, "company_name": company_name, "reason": f"{period} 缺少資產或負債資料"})
                         continue
                     
                     assets = float(assets_row[0])
                     liab   = float(liab_row[0])
-                    income = float(income_row[0]) if income_row else 0
-                    equity = float(equity_row[0]) if equity_row else 0
+                    income = float(income_row[0]) if income_row else None   # None = no data, never 0
+                    equity = float(equity_row[0]) if equity_row else None
+                    eps    = float(eps_row[0]) if eps_row else None            # year-to-date basic EPS (元)
                     
                     dr  = round(liab/assets*100, 2) if assets else 0
                     
                     # Annualise income
                     annualise = {"Q1":4.0,"Q2":2.0,"Q3":4/3,"Q4":1.0}.get(q,4/3)
-                    roa = round(income*annualise/assets*100, 2) if assets else 0
-                    roe = round(income*annualise/equity*100, 2) if equity else 0
+                    roa = round(income*annualise/assets*100, 2) if (assets and income is not None) else None
+                    roe = round(income*annualise/equity*100, 2) if (equity and income is not None) else None
                     
                     # FSC judgment
                     t = FSC_THRESHOLDS.get(industry, FSC_THRESHOLDS["FH"])
@@ -979,9 +1001,13 @@ def screen_all_institutions(period: str, metric: str = "負債比率", threshold
                         "負債比率": dr,
                         "ROA": roa,
                         "ROE": roe,
-                        "總資產": round(assets/100000, 0),
-                        "本期淨利": round(income/100000, 0),
-                    }.get(metric, dr)
+                        "總資產": round(assets/_TWD_PER_YI, 0),
+                        "本期淨利": round(income/_TWD_PER_YI, 0) if income is not None else None,
+                        "每股盈餘": eps,
+                    }[metric]
+                    if metric_value is None:
+                        skipped.append({"company_code": code, "company_name": company_name, "reason": f"{period} 缺少計算{metric}所需的資料"})
+                        continue
                     
                     if threshold is not None and metric_value < threshold:
                         continue
@@ -990,16 +1016,18 @@ def screen_all_institutions(period: str, metric: str = "負債比率", threshold
                         "company_code": code,
                         "company_name": company_name,
                         "industry_type": industry,
-                        "assets_yi": round(assets/100000, 0),
+                        "assets_yi": round(assets/_TWD_PER_YI, 0),
                         "debt_ratio": dr,
                         "roa": roa,
                         "roe": roe,
-                        "net_income_yi": round(income/100000, 0),
+                        "net_income_yi": round(income/_TWD_PER_YI, 0) if income is not None else None,
+                        "eps": eps,
                         "fsc_judgment": fsc,
                         "metric_value": metric_value,
                     })
                     
                 except Exception as e:
+                    skipped.append({"company_code": code, "company_name": "", "reason": f"{period} 讀取失敗：{type(e).__name__}"})
                     continue
         
         # Sort by metric value descending
@@ -1021,6 +1049,7 @@ def screen_all_institutions(period: str, metric: str = "負債比率", threshold
                 "高風險": highrisk_count
             },
             "ranked_institutions": results,
+            "skipped_institutions": skipped,
             "note": f"資料來源：台灣金管會MOPS XBRL官方申報。期間：{period}。排序：{metric}由高至低。"
         }, ensure_ascii=False, indent=2)
         
@@ -1109,7 +1138,8 @@ def compare_institutions(company_codes: list, period: str) -> str:
 
                     assets  = get_val(['ifrs-full_Assets','ifrs-full_EquityAndLiabilities'])
                     liab    = get_val(['ifrs-full_Liabilities'])
-                    equity  = get_val(['ifrs-full_EquityAttributableToOwnersOfParent','ifrs-full_Equity'])
+                    # equity basis: total first (same basis as get_credit_summary)
+                    equity  = get_val(['ifrs-full_Equity','ifrs-full_EquityAttributableToOwnersOfParent'])
                     income  = get_val(['ifrs-full_ProfitLoss','ifrs-full_ProfitLossFromContinuingOperations'], instant=False)
                     eps     = get_val(['ifrs-full_BasicEarningsLossPerShare'], instant=False)
                     cash    = get_val(['ifrs-full_CashAndCashEquivalents'])

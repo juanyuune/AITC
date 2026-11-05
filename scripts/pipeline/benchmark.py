@@ -3,6 +3,9 @@
 import json, sqlite3, urllib.request, datetime, sys, time, re
 
 BASE_URL  = "http://localhost:3001"
+import os as _os
+NO_CACHE  = _os.environ.get("BENCH_NO_CACHE") == "1"   # BENCH_NO_CACHE=1: backend skips its response cache
+ASK_TIMEOUT = 480 if NO_CACHE else 120                 # a cold analysis answer can take several minutes
 DB_PATH   = "/home/user/AITC/logs/observability.db"
 LOG_PATH  = "/home/user/AITC/logs/benchmark.log"
 BASELINE  = 0.70
@@ -64,8 +67,8 @@ QUESTIONS = [
     "code": "2891",
     "period": "2024Q3",
     "field": "股東權益",
-    "ground_truth_numeric": 483776292.0,
-    "ground_truth_display": "483,776,292 千元",
+    "ground_truth_numeric": 510469390.0,
+    "ground_truth_display": "510,469,390 千元",
     "must_not_contain": [
       "系統錯誤",
       "逾時",
@@ -240,8 +243,8 @@ QUESTIONS = [
     "code": "2881",
     "period": "2022Q4",
     "field": "股東權益",
-    "ground_truth_numeric": 565690551.0,
-    "ground_truth_display": "565,690,551 千元",
+    "ground_truth_numeric": 573609207.0,
+    "ground_truth_display": "573,609,207 千元",
     "must_not_contain": [
       "系統錯誤",
       "逾時",
@@ -320,8 +323,8 @@ QUESTIONS = [
     "code": "2884",
     "period": "2021Q3",
     "field": "股東權益",
-    "ground_truth_numeric": 189514515.0,
-    "ground_truth_display": "189,514,515 千元",
+    "ground_truth_numeric": 189660849.0,
+    "ground_truth_display": "189,660,849 千元",
     "must_not_contain": [
       "系統錯誤",
       "逾時",
@@ -480,8 +483,8 @@ QUESTIONS = [
     "code": "2891",
     "period": "2023Q3",
     "field": "ROE",
-    "ground_truth_numeric": 16.05,
-    "ground_truth_display": "16.05%",
+    "ground_truth_numeric": 15.21,
+    "ground_truth_display": "15.21%",
     "must_not_contain": [
       "系統錯誤",
       "逾時",
@@ -512,8 +515,8 @@ QUESTIONS = [
     "code": "2881",
     "period": "2022Q3",
     "field": "ROE",
-    "ground_truth_numeric": 20.53,
-    "ground_truth_display": "20.53%",
+    "ground_truth_numeric": 19.78,
+    "ground_truth_display": "19.78%",
     "must_not_contain": [
       "系統錯誤",
       "逾時",
@@ -560,8 +563,8 @@ QUESTIONS = [
     "code": "2881",
     "period": "2021Q3",
     "field": "ROE",
-    "ground_truth_numeric": 20.95,
-    "ground_truth_display": "20.95%",
+    "ground_truth_numeric": 20.18,
+    "ground_truth_display": "20.18%",
     "must_not_contain": [
       "系統錯誤",
       "逾時",
@@ -800,9 +803,13 @@ QUESTIONS = [
   }
 ]
 
-def ask(q, timeout=120):
+def ask(q, timeout=None):
+    timeout = timeout or ASK_TIMEOUT
     try:
-        payload = json.dumps({"question": q, "mode": "auto"}).encode()
+        body = {"question": q, "mode": "auto"}
+        if NO_CACHE:
+            body["no_cache"] = True
+        payload = json.dumps(body).encode()
         req = urllib.request.Request(
             BASE_URL + "/chatbot", data=payload,
             headers={"Content-Type": "application/json"}, method="POST"
@@ -862,6 +869,71 @@ COMPANY_ALIASES = {
     "中國信託": ["中信","中國信託","中國信託金融控股"],
 }
 
+# ── sanity checks added after the 5 Nov review (see patch_benchmark.py) ───────────────────────────────
+import os as _os
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+_END_OK = tuple("。！？；：）)」』】.!?%")
+_UNIT_PAIR = re.compile(r"(-?\d[\d,]*(?:\.\d+)?)億元（(-?\d[\d,]*)千元）")
+try:
+    sys.path.insert(0, _os.path.expanduser(_os.environ.get("AITC_VALIDATOR_DIR", "~/AITC-CreditInvestigationChatBotAgent")))
+    from src.api.answer_validator import check_analysis_claims as _check_analysis_claims
+except Exception as _e:                      # validator not importable: the analysis checks are skipped, not faked
+    _check_analysis_claims = None
+    print(f"[benchmark] analysis claim checks unavailable: {_e}")
+
+
+def _is_template_report(answer):
+    """Screen / compare reports are written by Python templates (title on the first line)."""
+    first = (answer.strip().split("\n") or [""])[0]
+    return "財務篩選報告】" in first or "機構財務比較分析】" in first
+
+
+def sanity(result, tc):
+    """Extra failures (each prefixed 'sanity:') that the keyword / number check cannot see."""
+    answer = result.get("answer", "") or ""
+    cat, model = tc.get("cat"), result.get("model", "")
+    out = []
+    if answer.lstrip().startswith("【系統提醒】本題原本的處理模組"):
+        out.append("sanity:fallback:answer came from the fallback flow (a model or module was unavailable)")
+    if cat == "ratio" and "【財務比率分析報告】" in answer:
+        for ln in answer.split("\n"):
+            s = ln.strip()
+            if len(_CJK_RE.findall(s)) >= 20 and not s.endswith(_END_OK):
+                out.append("sanity:cutoff:" + s[-18:])
+                break
+    for m in _UNIT_PAIR.finditer(answer):
+        try:
+            yi, qian = float(m.group(1).replace(",", "")), float(m.group(2).replace(",", ""))
+        except ValueError:
+            continue
+        if abs(yi - qian / 100000.0) > 1.0:
+            out.append(f"sanity:units:{m.group(1)}億元≠{m.group(2)}千元")
+            break
+    if cat == "analysis" and not _is_template_report(answer) and _check_analysis_claims:
+        j = re.search(r"(正常範圍|警示範圍|高風險範圍)", answer)
+        for it in _check_analysis_claims(answer, j.group(1) if j else "", "", tc.get("q", "")):
+            out.append(f"sanity:{it['kind']}:{it['sentence'][:24]}")
+    return out
+
+
+def _roe_from(answer, who):
+    """ROE (annualised, %) for one company from a ratio-route or compare-route answer; None if not found."""
+    m = re.search(r"ROE（年化）：\s*(-?\d+\.\d+)%", answer)
+    if m and who is None:
+        return float(m.group(1))
+    m = re.search(r"ROE年化[^\n]*?" + re.escape(who or "") + r"[：:]\s*(-?\d+\.\d+)%", answer) if who else None
+    return float(m.group(1)) if m else None
+
+
+def consistency():
+    """Same company, same period, same metric must give the same number on the ratio route and the compare route."""
+    r1 = ask("國泰金控 2024年第三季的ROE是多少？")
+    r2 = ask("富邦金控和國泰金控 2024年第三季的財務結構有何差異？")
+    a, b = _roe_from(r1.get("answer", ""), None), _roe_from(r2.get("answer", ""), "國泰金融")
+    ok = a is not None and b is not None and abs(a - b) <= 0.05
+    print(f"[consistency] 國泰金控 2024Q3 ROE  ratio route={a}  compare route={b}  -> {'OK' if ok else 'MISMATCH'}")
+    return ok
+
 def check(result, tc):
     answer = result.get("answer","")
     failures = []
@@ -875,10 +947,42 @@ def check(result, tc):
                 failures.append(f"missing:{term}")
     if tc.get("cat") in ("lookup","ratio") and tc.get("ground_truth_numeric") is not None:
         num_pass, num_reason = check_numeric(answer, tc["ground_truth_numeric"], tc["cat"])
+        if not num_pass:   # a question may list other accepted values (e.g. total vs parent-owners equity)
+            for _alt in tc.get("ground_truth_alt", []):
+                _ok, _why = check_numeric(answer, _alt, tc["cat"])
+                if _ok:
+                    num_pass, num_reason = True, _why + "(alt)"
+                    break
         if not num_pass: failures.append(f"numeric_fail:{num_reason}")
+    failures += sanity(result, tc)
     return len(failures)==0, failures
 
+def wait_ready(max_wait=420):
+    """Do not ask a single question before the models answer: a request that arrives while TAIDE is still loading is
+    served by a fallback model and fails for a reason that has nothing to do with the code."""
+    import os as _os, time as _time
+    if _os.environ.get("BENCH_SKIP_READY") == "1":
+        return
+    pending = [("TAIDE (taide-8b)", _os.environ.get("AITC_TAIDE_URL", "http://localhost:33001/v1/models"), "taide-8b"),
+               ("Qwen3-30B", _os.environ.get("AITC_QWEN_URL", "http://localhost:33000/v1/models"), "")]
+    deadline = _time.time() + max_wait
+    while pending and _time.time() < deadline:
+        for t in list(pending):
+            try:
+                with urllib.request.urlopen(t[1], timeout=5) as r:
+                    if t[2] in r.read().decode("utf-8", "replace"):
+                        pending.remove(t)
+                        print(f"[benchmark] {t[0]} is ready")
+            except Exception:
+                pass
+        if pending:
+            _time.sleep(5)
+    if pending:
+        print("[benchmark] STOP: not ready after %d s: %s - nothing was asked." % (max_wait, ", ".join(t[0] for t in pending)))
+        sys.exit(2)
+
 def main():
+    wait_ready()
     run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""CREATE TABLE IF NOT EXISTS benchmark_results (
@@ -914,7 +1018,8 @@ def main():
              tc.get("ground_truth_display","N/A"),result.get("answer","")[:200]))
         conn.commit()
     def rate(cat): r=cat_results[cat]; return sum(r)/len(r) if r else 0
-    pass_rate=passed_count/total; alert=1 if pass_rate<BASELINE else 0
+    _cons_ok = consistency()
+    pass_rate=passed_count/total; alert=1 if (pass_rate<BASELINE or not _cons_ok) else 0
     conn.execute("""INSERT INTO benchmark_runs
         (run_id,started_at,completed_at,total,passed,failed,pass_rate,alert,lookup_rate,ratio_rate,compare_rate,screen_rate,analysis_rate)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
@@ -922,7 +1027,7 @@ def main():
          rate("lookup"),rate("ratio"),rate("compare"),rate("screen"),rate("analysis")))
     conn.commit(); conn.close()
     print(); print("="*60)
-    summary=("OK" if not alert else "ALERT")+f" {passed_count}/{total} ({round(pass_rate*100)}%)"
+    summary=("OK" if not alert else "ALERT")+f" {passed_count}/{total} ({round(pass_rate*100)}%)"+("" if _cons_ok else " [consistency MISMATCH]")
     print(f"[benchmark] {summary}")
     print(f"  Lookup:{int(rate('lookup')*100)}% Ratio:{int(rate('ratio')*100)}% Compare:{int(rate('compare')*100)}% Screen:{int(rate('screen')*100)}% Analysis:{int(rate('analysis')*100)}%")
     if failed_ids: print(f"  Failed: {failed_ids}")
